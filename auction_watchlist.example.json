@@ -1,0 +1,33 @@
+{
+  "defaults": {
+    "region": "EU",
+    "limit": 20,
+    "sort": "time_created",
+    "order": "desc",
+    "additional": true
+  },
+  "items": [
+    {
+      "name": "Example item from API docs",
+      "itemId": "y1q9",
+      "maxBuyout": 1000000,
+      "maxHistoryMedianRatio": 0.85
+    },
+    {
+      "name": "Example stack filter",
+      "itemId": "replace_with_item_id",
+      "region": "RU",
+      "minAmount": 5,
+      "maxUnitBuyout": 25000,
+      "maxCurrentMinRatio": 0.95
+    },
+    {
+      "name": "Example artifact variant",
+      "itemId": "replace_with_artifact_id",
+      "region": "RU",
+      "artifactQualities": ["rare", "exceptional"],
+      "minUpgrade": 10,
+      "maxHistoryMedianRatio": 0.9
+    }
+  ]
+}
