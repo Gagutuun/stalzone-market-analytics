@@ -102,6 +102,11 @@ type MarketMovement = {
   lastCollected: string; signal: string; points: MovementPoint[]; events: MovementEvent[];
 };
 type MarketMovementResponse = { generatedAt: string; hours: number; markets: MarketMovement[] };
+type MarketOpportunity = {
+  insight: MarketInsight; score: number; buyPrice: number; expectedSellPrice: number;
+  netSellPrice: number; profitPerUnit: number; roiPercent: number; sellThroughPercent: number;
+  confidencePercent: number; confidence: "Высокая" | "Средняя" | "Низкая"; warnings: string[];
+};
 type RecommendationAction = "buy" | "sell" | "wait" | "hold" | "risk";
 type MarketRecommendation = {
   insight: MarketInsight; action: RecommendationAction; title: string; summary: string;
@@ -159,6 +164,7 @@ app.innerHTML = `
         <button data-view="config"><i data-lucide="sliders-horizontal"></i> Правила и фильтры</button>
         <button data-view="history"><i data-lucide="history"></i> История продаж</button>
         <button data-view="analytics"><i data-lucide="sparkles"></i> Аналитика</button>
+        <button data-view="scanner"><i data-lucide="circle-dollar-sign"></i> Сканер</button>
         <button data-view="movement"><i data-lucide="activity"></i> Движение рынка</button>
       </nav>
 
@@ -295,6 +301,30 @@ app.innerHTML = `
         <section id="analytics-list" class="analytics-list"><div class="analytics-empty"><i data-lucide="sparkles"></i><strong>Рассчитайте рыночные сигналы</strong><span>Нужны активные правила и доступ к API</span></div></section>
       </div>
 
+      <div id="scanner-view" class="workspace-view hidden">
+        <section class="scanner-head">
+          <div><span class="eyebrow">Поиск сделок</span><h2>Сканер возможностей</h2><small id="scanner-updated">Ранжирует предметы из активных правил</small></div>
+          <button id="scanner-load" class="primary"><i data-lucide="refresh-cw"></i> Сканировать</button>
+        </section>
+        <section class="scanner-toolbar">
+          <label><span>Регион</span><select id="scanner-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
+          <label><span>Горизонт продажи</span><select id="scanner-horizon"><option value="1">1 день</option><option value="3" selected>3 дня</option><option value="7">7 дней</option><option value="14">14 дней</option></select></label>
+          <label title="Комиссия и другие расходы при перепродаже"><span>Расходы</span><div class="scanner-number"><input id="scanner-fee" type="number" min="0" max="50" step="0.5" value="5" /><b>%</b></div></label>
+          <label title="Скрыть сделки с меньшей ожидаемой чистой доходностью"><span>Доходность от</span><div class="scanner-number"><input id="scanner-min-roi" type="number" min="-100" max="500" step="1" value="5" /><b>%</b></div></label>
+          <label class="scanner-search"><span>Поиск</span><div><i data-lucide="search"></i><input id="scanner-search" placeholder="Название или Item ID" /></div></label>
+        </section>
+        <section class="scanner-stats">
+          <div><span>Лучший индекс</span><strong id="scanner-best">—</strong><small id="scanner-best-name">нет расчёта</small></div>
+          <div><span>Подходит</span><strong id="scanner-count">—</strong><small>после фильтров</small></div>
+          <div><span>Средняя доходность</span><strong id="scanner-average-roi">—</strong><small>после расходов</small></div>
+          <div><span>Высокая уверенность</span><strong id="scanner-confident">—</strong><small>достаточно наблюдений</small></div>
+        </section>
+        <section class="scanner-explainer">
+          <i data-lucide="shield-check"></i><span><strong>Индекс 0–100</strong> учитывает чистую доходность, скорость реализации, устойчивость цены и качество данных. Это оценка рынка, а не гарантия продажи.</span>
+        </section>
+        <section id="scanner-list" class="scanner-list"><div class="scanner-empty"><i data-lucide="circle-dollar-sign"></i><strong>Запустите сканирование</strong><span>Нужны активные правила и история продаж</span></div></section>
+      </div>
+
       <div id="movement-view" class="workspace-view hidden">
         <section class="movement-head">
           <div><span class="eyebrow">Локальные наблюдения</span><h2>Движение рынка</h2><small id="movement-updated">Используются данные фонового сборщика</small></div>
@@ -370,6 +400,8 @@ let historyChart: IChartApi | undefined;
 let historyResizeObserver: ResizeObserver | undefined;
 let analyticsInsights: MarketInsight[] = [];
 let recommendationMovements: MarketMovement[] = [];
+let scannerInsights: MarketInsight[] = [];
+let scannerMovements: MarketMovement[] = [];
 let movementMarkets: MarketMovement[] = [];
 let selectedMovementKey: string | undefined;
 let movementChart: IChartApi | undefined;
@@ -546,11 +578,14 @@ function ruleTargetLabel(rule: Rule) {
   return rule.scope === "category" ? `Категория: ${rule.category}` : rule.itemId;
 }
 
-function switchView(view: "overview" | "config" | "history" | "analytics" | "movement") {
+type WorkspaceView = "overview" | "config" | "history" | "analytics" | "scanner" | "movement";
+
+function switchView(view: WorkspaceView) {
   $("#overview-view").classList.toggle("hidden", view !== "overview");
   $("#config-view").classList.toggle("hidden", view !== "config");
   $("#history-view").classList.toggle("hidden", view !== "history");
   $("#analytics-view").classList.toggle("hidden", view !== "analytics");
+  $("#scanner-view").classList.toggle("hidden", view !== "scanner");
   $("#movement-view").classList.toggle("hidden", view !== "movement");
   document.querySelectorAll<HTMLButtonElement>(".workspace-tabs button").forEach((button) =>
     button.classList.toggle("active", button.dataset.view === view));
@@ -950,6 +985,99 @@ async function loadAnalytics() {
   finally { $("#analytics-load").classList.remove("busy"); }
 }
 
+function opportunityFor(insight: MarketInsight, feePercent: number, horizonDays: number): MarketOpportunity | undefined {
+  if (insight.currentMinUnit == null || insight.medianUnit == null || insight.currentMinUnit <= 0 || insight.medianUnit <= 0) return undefined;
+  const movement = scannerMovements.find((item) => item.itemId === insight.itemId && item.region === insight.region);
+  const volatility = Math.max(0, insight.volatilityPercent ?? 35);
+  const negativeTrend = Math.max(0, -(insight.trendPercent ?? 0));
+  const haircutPercent = Math.min(12, Math.max(2, volatility * .15) + Math.min(5, negativeTrend * .25));
+  const expectedSellPrice = insight.medianUnit * (1 - haircutPercent / 100);
+  const netSellPrice = expectedSellPrice * (1 - feePercent / 100);
+  const profitPerUnit = netSellPrice - insight.currentMinUnit;
+  const roiPercent = profitPerUnit / insight.currentMinUnit * 100;
+
+  const dailyTurnoverPerLot = (insight.salesPerDay ?? 0) / Math.max(1, insight.activeLots);
+  const sellThroughPercent = (1 - Math.exp(-dailyTurnoverPerLot * horizonDays)) * 100;
+  const sampleQuality = Math.min(1, insight.salesSample / 100);
+  const coverageQuality = movement ? Math.min(1, movement.coveragePercent / 100) : .35;
+  const collectionQuality = movement ? Math.min(1, movement.collections / 10) : .25;
+  const confidencePercent = (sampleQuality * .5 + coverageQuality * .3 + collectionQuality * .2) * 100;
+  const confidence = confidencePercent >= 75 ? "Высокая" : confidencePercent >= 45 ? "Средняя" : "Низкая";
+
+  const roiPoints = Math.max(0, Math.min(1, (roiPercent + 5) / 30)) * 45;
+  const turnoverPoints = sellThroughPercent / 100 * 25;
+  const confidencePoints = confidencePercent / 100 * 20;
+  const stabilityPoints = Math.max(0, 10 - volatility / 5);
+  const supplyPenalty = Math.max(0, Math.min(10, ((movement?.supplyChangePercent ?? 0) - 15) / 4));
+  const score = Math.round(Math.max(0, Math.min(100, roiPoints + turnoverPoints + confidencePoints + stabilityPoints - supplyPenalty)));
+
+  const warnings = [...insight.risks];
+  if (haircutPercent >= 8) warnings.push("Цена выхода снижена из-за риска");
+  if (sellThroughPercent < 35) warnings.push(`Вероятно долгая продажа: более ${horizonDays} дн.`);
+  if ((movement?.supplyChangePercent ?? 0) >= 20) warnings.push("Предложение быстро растёт");
+  if (profitPerUnit <= 0) warnings.push("После расходов ожидается убыток");
+  return { insight, score, buyPrice: insight.currentMinUnit, expectedSellPrice, netSellPrice, profitPerUnit, roiPercent, sellThroughPercent, confidencePercent, confidence, warnings: [...new Set(warnings)] };
+}
+
+function scannerOpportunities() {
+  const fee = Math.max(0, Math.min(50, numberValue("scanner-fee") ?? 0));
+  const horizon = Number($<HTMLSelectElement>("#scanner-horizon").value);
+  return scannerInsights.map((item) => opportunityFor(item, fee, horizon)).filter((item): item is MarketOpportunity => item != null);
+}
+
+function renderScanner() {
+  const region = $<HTMLSelectElement>("#scanner-region").value;
+  const minRoi = numberValue("scanner-min-roi") ?? -Infinity;
+  const query = value("scanner-search").toLocaleLowerCase("ru");
+  const horizon = Number($<HTMLSelectElement>("#scanner-horizon").value);
+  const opportunities = scannerOpportunities().filter((item) => {
+    if (region !== "all" && item.insight.region !== region) return false;
+    if (item.roiPercent < minRoi) return false;
+    return `${item.insight.name} ${item.insight.itemId}`.toLocaleLowerCase("ru").includes(query);
+  }).sort((a, b) => b.score - a.score || b.roiPercent - a.roiPercent);
+  const best = opportunities[0];
+  const averageRoi = opportunities.length ? opportunities.reduce((sum, item) => sum + item.roiPercent, 0) / opportunities.length : undefined;
+  $("#scanner-best").textContent = best ? `${best.score}/100` : "—";
+  $("#scanner-best-name").textContent = best?.insight.name || "нет подходящих рынков";
+  $("#scanner-count").textContent = scannerInsights.length ? String(opportunities.length) : "—";
+  $("#scanner-average-roi").textContent = signedPercent(averageRoi);
+  $("#scanner-confident").textContent = scannerInsights.length ? String(opportunities.filter((item) => item.confidence === "Высокая").length) : "—";
+
+  $("#scanner-list").innerHTML = opportunities.map((item, index) => {
+    const scoreClass = item.score >= 75 ? "strong" : item.score >= 55 ? "interesting" : item.score >= 35 ? "watch" : "weak";
+    const roiClass = item.roiPercent > 0 ? "positive" : "negative";
+    const targetBuy = roundRecommendationPrice(item.netSellPrice / (1 + Math.max(0, minRoi) / 100));
+    return `<article class="opportunity-card ${scoreClass}" data-opportunity-id="${escapeHtml(item.insight.itemId)}" data-opportunity-region="${escapeHtml(item.insight.region)}" data-target-buy="${targetBuy}">
+      <header><span class="opportunity-rank">${index + 1}</span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)} · ${item.insight.salesSample} продаж</small></div><div class="opportunity-score ${scoreClass}"><strong>${item.score}</strong><span>из 100</span></div></header>
+      <div class="opportunity-prices"><div><span>Купить сейчас</span><strong>${money(item.buyPrice)} ₽</strong></div><i data-lucide="chevron-right"></i><div><span>Ожидаемая продажа</span><strong>${money(item.expectedSellPrice)} ₽</strong><small>консервативнее медианы ${money(item.insight.medianUnit)} ₽</small></div><i data-lucide="chevron-right"></i><div><span>После расходов</span><strong>${money(item.netSellPrice)} ₽</strong></div></div>
+      <div class="opportunity-result"><div><span>Чистая прибыль / шт.</span><strong class="${roiClass}">${item.profitPerUnit >= 0 ? "+" : ""}${money(item.profitPerUnit)} ₽</strong></div><div><span>Доходность</span><strong class="${roiClass}">${signedPercent(item.roiPercent)}</strong></div><div><span>Реализация за ${horizon} дн.</span><strong>${item.sellThroughPercent.toFixed(0)}%</strong><small>оценка по обороту</small></div><div><span>Уверенность</span><strong>${item.confidence}</strong><small>${item.confidencePercent.toFixed(0)}% качества данных</small></div></div>
+      <footer><div class="opportunity-warnings">${item.warnings.length ? item.warnings.slice(0, 3).map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Критичных рисков не найдено</span>`}</div><button class="secondary scanner-rule"><i data-lucide="plus"></i> Правило ≤ ${money(targetBuy)} ₽</button></footer>
+    </article>`;
+  }).join("") || `<div class="scanner-empty"><i data-lucide="search-x"></i><strong>${scannerInsights.length ? "Нет сделок по заданным условиям" : "Запустите сканирование"}</strong><span>${scannerInsights.length ? "Снизьте минимальную доходность или измените регион" : "Сканер проверит предметы из активных правил"}</span></div>`;
+  createIcons({ icons: appIcons });
+}
+
+async function loadScanner() {
+  if (!rules.length) { toast("Для сканера нужно хотя бы одно активное правило", true); return; }
+  $("#scanner-load").classList.add("busy");
+  $("#scanner-updated").textContent = `Проверяю рынки: ${expandedRules().length}`;
+  try {
+    const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules: expandedRules() });
+    scannerInsights = response.insights;
+    analyticsInsights = response.insights;
+    try {
+      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all" });
+      scannerMovements = movement.markets;
+      recommendationMovements = movement.markets;
+    } catch { scannerMovements = []; }
+    $("#scanner-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · ${scannerInsights.length} рынков`;
+    renderScanner();
+    await refreshCacheStatus();
+  } catch (error) {
+    toast(String(error), true); log(String(error), true); $("#scanner-updated").textContent = "Не удалось выполнить сканирование";
+  } finally { $("#scanner-load").classList.remove("busy"); }
+}
+
 function movementKey(market: MarketMovement) {
   return `${market.region}|${market.itemId}`;
 }
@@ -1231,6 +1359,7 @@ $("#upsert").addEventListener("click", () => {
     const rule = currentRule();
     ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === rule.itemId && summary.region === rule.region));
     analyticsInsights = [];
+    scannerInsights = [];
     if (editingIndex != null) rules[editingIndex] = rule;
     else { const duplicate = rules.findIndex((entry) => ruleTargetLabel(entry) === ruleTargetLabel(rule) && entry.region === rule.region); if (duplicate >= 0) rules[duplicate] = rule; else rules.push(rule); }
     editingIndex = undefined; setForm(); renderRules(); void persistRules(false); toast("Правило добавлено");
@@ -1239,7 +1368,7 @@ $("#upsert").addEventListener("click", () => {
 $("#rules-list").addEventListener("click", (event) => {
   const row = (event.target as HTMLElement).closest<HTMLElement>("[data-index]"); if (!row) return;
   const index = Number(row.dataset.index);
-  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; const removedIds = new Set(removed.itemIds || [removed.itemId]); rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(removedIds.has(summary.itemId) && summary.region === removed.region)); analyticsInsights = []; editingIndex = undefined; renderRules(); renderAnalytics(); void persistRules(false); return; }
+  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; const removedIds = new Set(removed.itemIds || [removed.itemId]); rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(removedIds.has(summary.itemId) && summary.region === removed.region)); analyticsInsights = []; scannerInsights = []; editingIndex = undefined; renderRules(); renderAnalytics(); renderScanner(); void persistRules(false); return; }
   editingIndex = index; setForm(rules[index]); renderRules(); $(".rule-editor").scrollIntoView({ behavior: "smooth" });
 });
 $("#save").addEventListener("click", () => void persistRules());
@@ -1258,9 +1387,10 @@ $("#check-once").addEventListener("click", () => void runCheck(true));
 $("#overview-check").addEventListener("click", () => void runCheck(true));
 $(".workspace-tabs").addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-view]"); if (!button) return;
-  const view = button.dataset.view as "overview" | "config" | "history" | "analytics" | "movement";
+  const view = button.dataset.view as WorkspaceView;
   if (view === "history" && selected && historyItem?.id !== selected.id) openHistory(selected); else switchView(view);
   if (view === "analytics" && !analyticsInsights.length && rules.length) void loadAnalytics();
+  if (view === "scanner" && !scannerInsights.length && rules.length) void loadScanner();
   if (view === "movement" && !movementMarkets.length) void loadMovement();
 });
 $("#market-rules").addEventListener("click", (event) => {
@@ -1302,6 +1432,30 @@ $("#history-reset").addEventListener("click", () => {
 updateHistorySourceControls();
 $("#analytics-load").addEventListener("click", () => void loadAnalytics());
 ["analytics-region", "analytics-signal", "analytics-sort"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderAnalytics));
+$("#scanner-load").addEventListener("click", () => void loadScanner());
+["scanner-region", "scanner-horizon"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderScanner));
+["scanner-fee", "scanner-min-roi", "scanner-search"].forEach((id) => input(id).addEventListener("input", renderScanner));
+$("#scanner-list").addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest(".scanner-rule");
+  const card = (event.target as HTMLElement).closest<HTMLElement>("[data-opportunity-id]");
+  if (!button || !card) return;
+  const itemId = card.dataset.opportunityId!;
+  const region = card.dataset.opportunityRegion!;
+  const item = catalog.find((candidate) => candidate.id === itemId);
+  const source = rules.find((rule) => rule.region === region && (rule.itemId === itemId || rule.itemIds?.includes(itemId)));
+  const draft: Rule = {
+    ...(source || { name: item?.nameRu || item?.nameEn || itemId, itemId, region }),
+    name: `${item?.nameRu || item?.nameEn || itemId} · возможность`, itemId, region,
+    scope: "item", category: undefined, itemIds: undefined, topN: undefined, groupId: undefined, groupTopN: undefined,
+  };
+  editingIndex = undefined;
+  setForm(draft);
+  const targetBuy = Number(card.dataset.targetBuy);
+  if (Number.isFinite(targetBuy) && targetBuy > 0) input("max-unit").value = String(targetBuy);
+  switchView("config");
+  renderRules();
+  toast("Правило покупки подготовлено");
+});
 $("#movement-load").addEventListener("click", () => void loadMovement());
 ["movement-hours", "movement-region"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", () => void loadMovement()));
 input("movement-search").addEventListener("input", renderMovement);

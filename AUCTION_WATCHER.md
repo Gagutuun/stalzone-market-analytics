@@ -82,6 +82,23 @@ The Tauri interface reads and writes the existing `auction_watchlist.json` and
 with the Python version. API credentials are read only by the Rust backend and
 are never exposed to the web interface.
 
+### Opportunity scanner
+
+The `Сканер` tab ranks the concrete item and region markets included in active
+rules. Its assumptions are adjustable without collecting the market again:
+
+- sale horizon from 1 to 14 days;
+- auction commission and other exit costs;
+- minimum expected net return;
+- region and item-name filters.
+
+The expected exit price starts from the 30-day sales median and receives a
+conservative haircut for price dispersion and a negative trend. Net return is
+calculated after the configured costs. Estimated sell-through uses sales per
+day relative to the number of active lots. The confidence grade combines sales
+sample size, local collection coverage, and collection count. These values are
+market estimates, not confirmation that a specific lot will sell.
+
 ## Python watcher
 
 The older dependency-free watcher remains available.
