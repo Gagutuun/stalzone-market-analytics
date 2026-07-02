@@ -85,6 +85,7 @@ type SalesHistoryEntry = { amount: number; price: number; unitPrice: number; tim
 type SalesHistoryResponse = { total: number; entries: SalesHistoryEntry[] };
 type MarketInsight = {
   name: string; itemId: string; region: string; activeLots: number; matchingLots: number;
+  artifactQualities: ArtifactQuality[]; minUpgrade?: number; maxUpgrade?: number;
   salesSample: number; soldAmount: number; currentMinUnit?: number; medianUnit?: number;
   averageUnit?: number; p25Unit?: number; p75Unit?: number; discountPercent?: number;
   trendPercent?: number; volatilityPercent?: number; salesPerDay?: number;
@@ -92,6 +93,8 @@ type MarketInsight = {
   verdict: string; risks: string[];
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
+type TimingBucket = { key: number; medianMinUnit: number; samples: number; discountPercent: number };
+type MarketTimingResponse = { periodDays: number; totalSamples: number; overallMedianMin?: number; hourWindows: TimingBucket[]; weekdays: TimingBucket[] };
 type MovementPoint = { time: number; supply: number; minUnit?: number; medianUnit?: number };
 type MovementEvent = { kind: "appeared" | "missing" | "ended" | "probable_sale"; time: string; amount: number; buyout?: number; unitPrice?: number; quality?: string; upgrade?: number; lifetimeMinutes?: number; confidence?: number };
 type MarketMovement = {
@@ -373,6 +376,20 @@ app.innerHTML = `
 
   <dialog id="analysis-dialog"><div class="dialog-head"><div><span class="eyebrow">Срез рынка</span><h2>Анализ цен</h2></div><button class="icon-button" data-close="analysis-dialog"><i data-lucide="x"></i></button></div><div id="analysis-content"></div></dialog>
   <dialog id="details-dialog"><div class="dialog-head"><div><span class="eyebrow">Уведомление</span><h2>Детали лота</h2></div><button class="icon-button" data-close="details-dialog"><i data-lucide="x"></i></button></div><pre id="details-content"></pre></dialog>
+  <dialog id="scenario-dialog" class="scenario-dialog"><div class="dialog-head"><div><span class="eyebrow">Сценарий сделки</span><h2>А что если?</h2></div><button class="icon-button" data-close="scenario-dialog"><i data-lucide="x"></i></button></div><div class="scenario-content">
+    <header class="scenario-market"><div><strong id="scenario-name">—</strong><span id="scenario-context">—</span></div><small>Изменяйте значения — расчёт обновится сразу</small></header>
+    <section class="scenario-inputs">
+      <label><span>Купить за / шт.</span><div class="money-input"><input id="scenario-buy" type="number" min="0" /><b>₽</b></div></label>
+      <label><span>Продать за / шт.</span><div class="money-input"><input id="scenario-sell" type="number" min="0" /><b>₽</b></div></label>
+      <label><span>Количество</span><input id="scenario-amount" type="number" min="1" value="1" /></label>
+      <label><span>Расходы</span><div class="percent-input"><input id="scenario-fee" type="number" min="0" max="50" step="0.5" /><b>%</b></div></label>
+    </section>
+    <section class="scenario-results">
+      <div><span>Вложение</span><strong id="scenario-investment">—</strong></div><div><span>Выручка</span><strong id="scenario-revenue">—</strong></div><div><span>Чистая прибыль</span><strong id="scenario-profit">—</strong></div><div><span>Доходность</span><strong id="scenario-roi">—</strong></div>
+    </section>
+    <section class="scenario-summary"><i data-lucide="circle-dollar-sign"></i><div><strong id="scenario-verdict">Введите цены</strong><span id="scenario-break-even">Здесь появится точка безубыточности</span></div></section>
+    <section class="timing-section"><header><div><span class="eyebrow">Локальные снимки</span><h3>Когда покупать дешевле</h3></div><small id="timing-sample">Загрузка...</small></header><div id="timing-content" class="timing-content"><div class="timing-loading"><span></span>Анализирую время наблюдений</div></div></section>
+  </div></dialog>
   <div id="toast" class="toast"></div>
 `;
 
@@ -410,6 +427,7 @@ let analyticsInsights: MarketInsight[] = [];
 let recommendationMovements: MarketMovement[] = [];
 let scannerInsights: MarketInsight[] = [];
 let scannerMovements: MarketMovement[] = [];
+let scenarioOpportunity: MarketOpportunity | undefined;
 let movementMarkets: MarketMovement[] = [];
 let selectedMovementKey: string | undefined;
 let movementChart: IChartApi | undefined;
@@ -1033,6 +1051,11 @@ function scannerOpportunities() {
   return scannerInsights.map((item) => opportunityFor(item, fee, horizon)).filter((item): item is MarketOpportunity => item != null);
 }
 
+function insightVariantLabel(insight: MarketInsight) {
+  const qualities = insight.artifactQualities.map((value) => artifactQualities.find((quality) => quality.value === value)?.label).filter(Boolean);
+  return [...qualities, describeRange("заточка", insight.minUpgrade, insight.maxUpgrade, "+")].filter(Boolean).join(", ");
+}
+
 function renderScanner() {
   const region = $<HTMLSelectElement>("#scanner-region").value;
   const minRoi = numberValue("scanner-min-roi") ?? -Infinity;
@@ -1055,14 +1078,86 @@ function renderScanner() {
     const scoreClass = item.score >= 75 ? "strong" : item.score >= 55 ? "interesting" : item.score >= 35 ? "watch" : "weak";
     const roiClass = item.roiPercent > 0 ? "positive" : "negative";
     const targetBuy = roundRecommendationPrice(item.netSellPrice / (1 + Math.max(0, minRoi) / 100));
-    return `<article class="opportunity-card ${scoreClass}" data-opportunity-id="${escapeHtml(item.insight.itemId)}" data-opportunity-region="${escapeHtml(item.insight.region)}" data-target-buy="${targetBuy}">
-      <header><span class="opportunity-rank">${index + 1}</span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)} · ${item.insight.salesSample} продаж</small></div><div class="opportunity-score ${scoreClass}"><strong>${item.score}</strong><span>из 100</span></div></header>
+    const insightIndex = scannerInsights.indexOf(item.insight);
+    const variant = insightVariantLabel(item.insight);
+    return `<article class="opportunity-card ${scoreClass}" data-opportunity-index="${insightIndex}" data-opportunity-id="${escapeHtml(item.insight.itemId)}" data-opportunity-region="${escapeHtml(item.insight.region)}" data-target-buy="${targetBuy}">
+      <header><span class="opportunity-rank">${index + 1}</span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)} · ${item.insight.salesSample} продаж${variant ? ` · ${escapeHtml(variant)}` : ""}</small></div><div class="opportunity-score ${scoreClass}"><strong>${item.score}</strong><span>из 100</span></div></header>
       <div class="opportunity-prices"><div><span>Купить сейчас</span><strong>${money(item.buyPrice)} ₽</strong></div><i data-lucide="chevron-right"></i><div><span>Ожидаемая продажа</span><strong>${money(item.expectedSellPrice)} ₽</strong><small>консервативнее медианы ${money(item.insight.medianUnit)} ₽</small></div><i data-lucide="chevron-right"></i><div><span>После расходов</span><strong>${money(item.netSellPrice)} ₽</strong></div></div>
       <div class="opportunity-result"><div><span>Чистая прибыль / шт.</span><strong class="${roiClass}">${item.profitPerUnit >= 0 ? "+" : ""}${money(item.profitPerUnit)} ₽</strong></div><div><span>Доходность</span><strong class="${roiClass}">${signedPercent(item.roiPercent)}</strong></div><div><span>Реализация за ${horizon} дн.</span><strong>${item.sellThroughPercent.toFixed(0)}%</strong><small>оценка по обороту</small></div><div><span>Уверенность</span><strong>${item.confidence}</strong><small>${item.confidencePercent.toFixed(0)}% качества данных</small></div></div>
-      <footer><div class="opportunity-warnings">${item.warnings.length ? item.warnings.slice(0, 3).map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Критичных рисков не найдено</span>`}</div><button class="secondary scanner-rule"><i data-lucide="plus"></i> Правило ≤ ${money(targetBuy)} ₽</button></footer>
+      <footer><div class="opportunity-warnings">${item.warnings.length ? item.warnings.slice(0, 3).map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Критичных рисков не найдено</span>`}</div><div class="opportunity-actions"><button class="secondary scenario-open"><i data-lucide="gauge"></i> А что если?</button><button class="secondary scanner-rule"><i data-lucide="plus"></i> Правило ≤ ${money(targetBuy)} ₽</button></div></footer>
     </article>`;
   }).join("") || `<div class="scanner-empty"><i data-lucide="search-x"></i><strong>${scannerInsights.length ? "Нет сделок по заданным условиям" : "Запустите сканирование"}</strong><span>${scannerInsights.length ? "Снизьте минимальную доходность или измените регион" : "Сканер проверит предметы из активных правил"}</span></div>`;
   createIcons({ icons: appIcons });
+}
+
+function renderScenarioCalculation() {
+  if (!scenarioOpportunity) return;
+  const buy = Math.max(0, numberValue("scenario-buy") ?? 0);
+  const sell = Math.max(0, numberValue("scenario-sell") ?? 0);
+  const amount = Math.max(1, Math.floor(numberValue("scenario-amount") ?? 1));
+  const fee = Math.max(0, Math.min(50, numberValue("scenario-fee") ?? 0));
+  const investment = buy * amount;
+  const revenue = sell * amount;
+  const netRevenue = revenue * (1 - fee / 100);
+  const profit = netRevenue - investment;
+  const roi = investment > 0 ? profit / investment * 100 : undefined;
+  const breakEven = fee < 100 ? buy / (1 - fee / 100) : undefined;
+  $("#scenario-investment").textContent = `${money(investment)} ₽`;
+  $("#scenario-revenue").textContent = `${money(revenue)} ₽`;
+  $("#scenario-profit").textContent = `${profit >= 0 ? "+" : ""}${money(profit)} ₽`;
+  $("#scenario-profit").className = profit >= 0 ? "positive" : "negative";
+  $("#scenario-roi").textContent = signedPercent(roi);
+  $("#scenario-roi").className = (roi ?? 0) >= 0 ? "positive" : "negative";
+  const fair = scenarioOpportunity.insight.medianUnit;
+  const fairDelta = fair && sell > 0 ? (sell - fair) / fair * 100 : undefined;
+  $("#scenario-verdict").textContent = buy <= 0 || sell <= 0 ? "Введите цены покупки и продажи"
+    : profit > 0 ? `Сценарий даёт ${money(profit)} ₽ после расходов`
+    : profit === 0 ? "Сценарий выходит в ноль" : `Сценарий теряет ${money(Math.abs(profit))} ₽`;
+  $("#scenario-break-even").textContent = breakEven == null ? "Точка безубыточности недоступна"
+    : `Безубыточная продажа: ${money(breakEven)} ₽/шт.${fairDelta == null ? "" : ` · ваша цена ${signedPercent(fairDelta)} к медиане`}`;
+}
+
+function renderMarketTiming(timing: MarketTimingResponse) {
+  const weekdays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
+  $("#timing-sample").textContent = `${timing.totalSamples} полных снимков · ${timing.periodDays} дней`;
+  if (!timing.totalSamples) {
+    $("#timing-content").innerHTML = `<div class="timing-empty"><i data-lucide="clock-3"></i><strong>Пока недостаточно локальных снимков</strong><span>Запущенный мониторинг постепенно накопит данные по времени покупки</span></div>`;
+    createIcons({ icons: appIcons });
+    return;
+  }
+  const rows = (items: TimingBucket[], label: (key: number) => string) => items.slice(0, 4).map((item, index) => `
+    <div class="timing-row${index === 0 ? " best" : ""}"><span>${index + 1}</span><div><strong>${escapeHtml(label(item.key))}</strong><small>${item.samples} снимков</small></div><b>${money(item.medianMinUnit)} ₽</b><em class="${item.discountPercent >= 0 ? "positive" : "negative"}">${signedPercent(item.discountPercent)}</em></div>`).join("");
+  $("#timing-content").innerHTML = `<div class="timing-column"><header><i data-lucide="clock-3"></i><strong>Время суток</strong></header>${rows(timing.hourWindows, (key) => `${String(key).padStart(2, "0")}:00–${String((key + 3) % 24).padStart(2, "0")}:00`)}</div><div class="timing-column"><header><i data-lucide="bar-chart-3"></i><strong>Дни недели</strong></header>${rows(timing.weekdays, (key) => weekdays[key] || "—")}</div><p>Скидка рассчитана к медиане минимальных цен всех полных снимков: ${money(timing.overallMedianMin)} ₽. Время показано по часовому поясу компьютера.</p>`;
+  createIcons({ icons: appIcons });
+}
+
+async function openScenario(opportunity: MarketOpportunity) {
+  scenarioOpportunity = opportunity;
+  const insight = opportunity.insight;
+  $("#scenario-name").textContent = insight.name;
+  $("#scenario-context").textContent = `${insight.region} · ${insight.itemId}${insightVariantLabel(insight) ? ` · ${insightVariantLabel(insight)}` : ""}`;
+  input("scenario-buy").value = String(Math.round(opportunity.buyPrice));
+  input("scenario-sell").value = String(Math.round(opportunity.expectedSellPrice));
+  input("scenario-amount").value = "1";
+  input("scenario-fee").value = String(numberValue("scanner-fee") ?? 0);
+  renderScenarioCalculation();
+  $("#timing-sample").textContent = "Загрузка...";
+  $("#timing-content").innerHTML = `<div class="timing-loading"><span></span>Анализирую время наблюдений</div>`;
+  $<HTMLDialogElement>("#scenario-dialog").showModal();
+  try {
+    const timing = await invoke<MarketTimingResponse>("market_timing", {
+      itemId: insight.itemId,
+      region: insight.region,
+      qualities: insight.artifactQualities,
+      minUpgrade: insight.minUpgrade ?? null,
+      maxUpgrade: insight.maxUpgrade ?? null,
+      timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+    });
+    if (scenarioOpportunity === opportunity) renderMarketTiming(timing);
+  } catch (error) {
+    $("#timing-content").innerHTML = `<div class="timing-empty"><i data-lucide="triangle-alert"></i><strong>Не удалось рассчитать время</strong><span>${escapeHtml(String(error))}</span></div>`;
+    createIcons({ icons: appIcons });
+  }
 }
 
 async function loadScanner() {
@@ -1457,9 +1552,16 @@ $("#scanner-load").addEventListener("click", () => void loadScanner());
 ["scanner-region", "scanner-horizon"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderScanner));
 ["scanner-fee", "scanner-min-roi", "scanner-search"].forEach((id) => input(id).addEventListener("input", renderScanner));
 $("#scanner-list").addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest(".scanner-rule");
   const card = (event.target as HTMLElement).closest<HTMLElement>("[data-opportunity-id]");
-  if (!button || !card) return;
+  if (!card) return;
+  if ((event.target as HTMLElement).closest(".scenario-open")) {
+    const insight = scannerInsights[Number(card.dataset.opportunityIndex)];
+    const opportunity = insight && opportunityFor(insight, Math.max(0, numberValue("scanner-fee") ?? 0), Number($<HTMLSelectElement>("#scanner-horizon").value));
+    if (opportunity) void openScenario(opportunity);
+    return;
+  }
+  const button = (event.target as HTMLElement).closest(".scanner-rule");
+  if (!button) return;
   const itemId = card.dataset.opportunityId!;
   const region = card.dataset.opportunityRegion!;
   const item = catalog.find((candidate) => candidate.id === itemId);
@@ -1477,6 +1579,7 @@ $("#scanner-list").addEventListener("click", (event) => {
   renderRules();
   toast("Правило покупки подготовлено");
 });
+["scenario-buy", "scenario-sell", "scenario-amount", "scenario-fee"].forEach((id) => input(id).addEventListener("input", renderScenarioCalculation));
 $("#movement-load").addEventListener("click", () => void loadMovement());
 ["movement-hours", "movement-region"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", () => void loadMovement()));
 $("#movement-quality-options").addEventListener("change", () => void loadMovement());

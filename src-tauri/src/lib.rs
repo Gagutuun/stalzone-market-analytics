@@ -123,6 +123,9 @@ struct MarketInsight {
     name: String,
     item_id: String,
     region: String,
+    artifact_qualities: Vec<String>,
+    min_upgrade: Option<i64>,
+    max_upgrade: Option<i64>,
     active_lots: usize,
     matching_lots: usize,
     sales_sample: usize,
@@ -148,6 +151,25 @@ struct MarketInsight {
 struct MarketAnalyticsResponse {
     generated_at: String,
     insights: Vec<MarketInsight>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimingBucket {
+    key: u8,
+    median_min_unit: f64,
+    samples: usize,
+    discount_percent: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketTimingResponse {
+    period_days: i64,
+    total_samples: usize,
+    overall_median_min: Option<f64>,
+    hour_windows: Vec<TimingBucket>,
+    weekdays: Vec<TimingBucket>,
 }
 
 #[derive(Serialize)]
@@ -1084,6 +1106,17 @@ fn market_movement(
     min_upgrade: Option<i64>,
     max_upgrade: Option<i64>,
 ) -> Result<MarketMovementResponse, String> {
+    let filters = market_filters(&qualities, min_upgrade, max_upgrade)?;
+    reconcile_all_sale_matches()?;
+    let connection = open_cache()?;
+    market_movement_from(&connection, hours, region, filters, chrono::Utc::now())
+}
+
+fn market_filters(
+    qualities: &[String],
+    min_upgrade: Option<i64>,
+    max_upgrade: Option<i64>,
+) -> Result<MovementFilters, String> {
     if min_upgrade.is_some_and(|value| !(0..=15).contains(&value))
         || max_upgrade.is_some_and(|value| !(0..=15).contains(&value)) {
         return Err("Заточка должна быть в диапазоне от 0 до 15".into());
@@ -1091,14 +1124,94 @@ fn market_movement(
     if min_upgrade.zip(max_upgrade).is_some_and(|(min, max)| min > max) {
         return Err("Минимальная заточка не может быть больше максимальной".into());
     }
-    let filters = MovementFilters {
+    Ok(MovementFilters {
         quality_mask: qualities.iter().filter_map(|name| quality_code(name)).fold(0, |mask, code| mask | (1 << code)),
         min_upgrade,
         max_upgrade,
-    };
-    reconcile_all_sale_matches()?;
+    })
+}
+
+fn timing_buckets(groups: HashMap<u8, Vec<f64>>, overall: f64) -> Vec<TimingBucket> {
+    let mut buckets: Vec<TimingBucket> = groups.into_iter().filter_map(|(key, values)| {
+        let bucket_median = median(&values)?;
+        Some(TimingBucket {
+            key,
+            median_min_unit: bucket_median,
+            samples: values.len(),
+            discount_percent: (overall - bucket_median) / overall * 100.0,
+        })
+    }).collect();
+    buckets.sort_by(|a, b| a.median_min_unit.total_cmp(&b.median_min_unit).then_with(|| b.samples.cmp(&a.samples)));
+    buckets
+}
+
+#[tauri::command]
+fn market_timing(
+    item_id: String,
+    region: String,
+    qualities: Vec<String>,
+    min_upgrade: Option<i64>,
+    max_upgrade: Option<i64>,
+    timezone_offset_minutes: i64,
+) -> Result<MarketTimingResponse, String> {
+    let filters = market_filters(&qualities, min_upgrade, max_upgrade)?;
     let connection = open_cache()?;
-    market_movement_from(&connection, hours, region, filters, chrono::Utc::now())
+    market_timing_from(
+        &connection,
+        item_id.trim(),
+        &region.to_ascii_uppercase(),
+        filters,
+        timezone_offset_minutes.clamp(-720, 840),
+        chrono::Utc::now(),
+    )
+}
+
+fn market_timing_from(
+    connection: &Connection,
+    item_id: &str,
+    region: &str,
+    filters: MovementFilters,
+    timezone_offset_minutes: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<MarketTimingResponse, String> {
+    let period_days = 30;
+    let cutoff = now.timestamp() - period_days * 86_400;
+    let collections: Vec<(i64, i64)> = {
+        let mut statement = connection.prepare(
+            "SELECT id, collected_timestamp FROM market_collections
+             WHERE item_id = ?1 AND region = ?2 AND collected_timestamp >= ?3 AND complete = 1
+             ORDER BY collected_timestamp"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map(params![item_id, region, cutoff], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let mut minima = Vec::new();
+    let mut hours: HashMap<u8, Vec<f64>> = HashMap::new();
+    let mut weekdays: HashMap<u8, Vec<f64>> = HashMap::new();
+    for (collection_id, timestamp) in collections {
+        let (_, prices) = collection_market_values(connection, collection_id, filters)?;
+        let Some(minimum) = prices.into_iter().min_by(f64::total_cmp) else { continue };
+        let local_timestamp = timestamp + timezone_offset_minutes * 60;
+        let local_days = local_timestamp.div_euclid(86_400);
+        let hour = local_timestamp.rem_euclid(86_400).div_euclid(3_600) as u8;
+        let hour_window = hour / 3 * 3;
+        let weekday = (local_days + 3).rem_euclid(7) as u8;
+        minima.push(minimum);
+        hours.entry(hour_window).or_default().push(minimum);
+        weekdays.entry(weekday).or_default().push(minimum);
+    }
+    let overall_median_min = median(&minima);
+    let (hour_windows, weekday_buckets) = overall_median_min
+        .map(|overall| (timing_buckets(hours, overall), timing_buckets(weekdays, overall)))
+        .unwrap_or_default();
+    Ok(MarketTimingResponse {
+        period_days,
+        total_samples: minima.len(),
+        overall_median_min,
+        hour_windows,
+        weekdays: weekday_buckets,
+    })
 }
 
 fn market_movement_from(
@@ -1363,6 +1476,7 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
         save_market_snapshot(&rule, &lots, matching_lots)?;
         insights.push(MarketInsight {
             name: rule.name, item_id: rule.item_id, region: rule.region,
+            artifact_qualities: rule.artifact_qualities, min_upgrade: rule.min_upgrade, max_upgrade: rule.max_upgrade,
             active_lots: comparable_lots.len(), matching_lots, sales_sample: history_units.len(),
             sold_amount: comparable_history.iter().map(|row| amount(row)).sum(),
             current_min_unit: current_min, median_unit: history_median, average_unit: average,
@@ -1678,7 +1792,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { check_lock: tokio::sync::Mutex::new(()) })
-        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, market_movement, market_analytics, check_rules, load_rules, save_rules])
+        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, market_movement, market_timing, market_analytics, check_rules, load_rules, save_rules])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }
@@ -1828,6 +1942,40 @@ mod tests {
         assert_eq!(market.official_sales, 1);
         assert_eq!(market.active_lots, 2);
         assert!(market.events.iter().all(|event| event.quality.as_deref() == Some("Особый") && event.upgrade == Some(15)));
+    }
+
+    #[test]
+    fn market_timing_ranks_local_hour_windows_and_weekdays() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (index, (timestamp, price)) in [
+            (now.timestamp(), 100),
+            ((now - chrono::Duration::days(1)).timestamp(), 120),
+            ((now - chrono::Duration::hours(8)).timestamp(), 80),
+        ].into_iter().enumerate() {
+            connection.execute(
+                "INSERT INTO market_collections
+                 (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+                 VALUES (?1, ?2, 'item', 'RU', 1, 1, 1)",
+                params![chrono::DateTime::from_timestamp(timestamp, 0).unwrap().to_rfc3339(), timestamp]
+            ).unwrap();
+            let collection_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO lot_observations
+                 (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                 VALUES (?1, ?2, 'item', 'RU', 1, ?3, '{}')",
+                params![collection_id, format!("timing-{index}"), price]
+            ).unwrap();
+        }
+
+        let timing = market_timing_from(&connection, "item", "RU", MovementFilters::default(), 0, now).expect("timing response");
+        assert_eq!(timing.total_samples, 3);
+        assert_eq!(timing.overall_median_min, Some(100.0));
+        assert_eq!(timing.hour_windows[0].key, 3);
+        assert_eq!(timing.hour_windows[0].median_min_unit, 80.0);
+        assert_eq!(timing.weekdays[0].key, 3);
+        assert_eq!(timing.weekdays[0].median_min_unit, 90.0);
     }
 
     #[test]

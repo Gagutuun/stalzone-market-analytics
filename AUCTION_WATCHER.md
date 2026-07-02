@@ -103,6 +103,13 @@ day relative to the number of active lots. The confidence grade combines sales
 sample size, local collection coverage, and collection count. These values are
 market estimates, not confirmation that a specific lot will sell.
 
+Each opportunity also has an `А что если?` scenario tool. It recalculates the
+investment, gross revenue, net profit, return, and break-even sale price for a
+custom purchase price, sale price, quantity, and expense rate. Its timing panel
+uses complete local collections from the last 30 days. It ranks three-hour
+windows and weekdays by the median observed minimum listing price while keeping
+artifact quality, upgrade filters, region, and the computer timezone isolated.
+
 ## Python watcher
 
 The older dependency-free watcher remains available.
