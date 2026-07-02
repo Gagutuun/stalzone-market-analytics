@@ -93,7 +93,7 @@ type MarketInsight = {
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
 type MovementPoint = { time: number; supply: number; minUnit?: number; medianUnit?: number };
-type MovementEvent = { kind: "appeared" | "missing" | "ended" | "probable_sale"; time: string; amount: number; buyout?: number; unitPrice?: number; lifetimeMinutes?: number; confidence?: number };
+type MovementEvent = { kind: "appeared" | "missing" | "ended" | "probable_sale"; time: string; amount: number; buyout?: number; unitPrice?: number; quality?: string; upgrade?: number; lifetimeMinutes?: number; confidence?: number };
 type MarketMovement = {
   itemId: string; region: string; currentSupply: number; supplyChangePercent?: number;
   currentMinUnit?: number; currentMedianUnit?: number; priceChangePercent?: number;
@@ -335,6 +335,14 @@ app.innerHTML = `
           <label><span>Регион</span><select id="movement-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
           <label class="movement-search"><span>Поиск</span><div><i data-lucide="search"></i><input id="movement-search" placeholder="Название или Item ID" /></div></label>
           <div class="movement-note"><i data-lucide="shield-check"></i><span>Исчезновение фиксируется только при полном обходе рынка</span></div>
+        </section>
+        <section class="movement-variant-toolbar">
+          <div class="movement-variant-title"><i data-lucide="gem"></i><div><strong>Вариант артефакта</strong><span>График и все показатели пересчитываются только по выбранным вариантам</span></div></div>
+          <div id="movement-quality-options" class="quality-options movement-quality-options">
+            ${artifactQualities.map((quality) => `<label class="quality-chip ${quality.value}"><input type="checkbox" value="${quality.value}" /><span>${quality.label}</span></label>`).join("")}
+          </div>
+          <div class="movement-upgrade-filter"><span>Заточка</span><label>от <input id="movement-min-upgrade" type="number" min="0" max="15" placeholder="+0" /></label><b>—</b><label>до <input id="movement-max-upgrade" type="number" min="0" max="15" placeholder="+15" /></label></div>
+          <button id="movement-reset-variant" class="icon-button" title="Сбросить редкость и заточку"><i data-lucide="x"></i></button>
         </section>
         <section class="movement-stats">
           <div><span>Рынков</span><strong id="movement-markets">—</strong></div>
@@ -974,7 +982,7 @@ async function loadAnalytics() {
     const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules: analysisRules });
     analyticsInsights = response.insights;
     try {
-      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all" });
+      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all", qualities: [], minUpgrade: null, maxUpgrade: null });
       recommendationMovements = movement.markets;
     } catch { recommendationMovements = []; }
     $("#analytics-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
@@ -1066,7 +1074,7 @@ async function loadScanner() {
     scannerInsights = response.insights;
     analyticsInsights = response.insights;
     try {
-      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all" });
+      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all", qualities: [], minUpgrade: null, maxUpgrade: null });
       scannerMovements = movement.markets;
       recommendationMovements = movement.markets;
     } catch { scannerMovements = []; }
@@ -1140,15 +1148,16 @@ function renderMovementDetail(market?: MarketMovement) {
   const events = market.events.map((event) => {
     const labels = { appeared: "Появился", missing: "Исчез", ended: "Завершился", probable_sale: "Вероятно продан" };
     const confidence = event.confidence == null ? "" : ` · ${Math.round(event.confidence * 100)}%`;
-    return `<tr><td><span class="movement-event ${event.kind}">${labels[event.kind]}${confidence}</span></td><td>${escapeHtml(new Date(event.time).toLocaleString("ru-RU"))}</td><td>${event.amount.toLocaleString("ru-RU")}</td><td>${money(event.unitPrice)} ₽</td><td>${event.lifetimeMinutes == null ? "—" : formatInterval(event.lifetimeMinutes)}</td></tr>`;
-  }).join("") || `<tr><td colspan="5" class="table-empty">За период событий пока нет</td></tr>`;
+    const variant = [event.quality, event.upgrade == null ? "" : `+${event.upgrade}`].filter(Boolean).join(" · ") || "—";
+    return `<tr><td><span class="movement-event ${event.kind}">${labels[event.kind]}${confidence}</span></td><td>${escapeHtml(new Date(event.time).toLocaleString("ru-RU"))}</td><td>${escapeHtml(variant)}</td><td>${event.amount.toLocaleString("ru-RU")}</td><td>${money(event.unitPrice)} ₽</td><td>${event.lifetimeMinutes == null ? "—" : formatInterval(event.lifetimeMinutes)}</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="table-empty">За период событий пока нет</td></tr>`;
   $("#movement-detail").innerHTML = `
     <header class="movement-detail-head"><div><span class="rule-region">${escapeHtml(market.region)}</span><div><h3>${escapeHtml(movementItemName(market.itemId))}</h3><small>${escapeHtml(market.itemId)} · последнее наблюдение ${escapeHtml(new Date(market.lastCollected).toLocaleString("ru-RU"))}</small></div></div><span class="movement-signal ${signalClass}">${escapeHtml(market.signal)}</span></header>
     <div class="movement-metrics"><div><span>Предложение</span><strong>${market.currentSupply.toLocaleString("ru-RU")}</strong><small class="${(market.supplyChangePercent ?? 0) > 0 ? "negative" : "positive"}">${signedPercent(market.supplyChangePercent)}</small></div><div><span>Медиана / шт.</span><strong>${money(market.currentMedianUnit)} ₽</strong><small class="${(market.priceChangePercent ?? 0) > 0 ? "positive" : "negative"}">${signedPercent(market.priceChangePercent)}</small></div><div><span>Минимум / шт.</span><strong>${money(market.currentMinUnit)} ₽</strong><small>${market.collections} проходов</small></div><div><span>Среднее время жизни</span><strong>${formatInterval(market.averageLifetimeMinutes)}</strong><small>исчезнувшие и завершённые</small></div></div>
     <div class="movement-quality"><div><span>Официальных продаж</span><strong>${market.officialSales.toLocaleString("ru-RU")}</strong></div><div><span>Вероятно сопоставлено</span><strong>${market.probableSales.toLocaleString("ru-RU")}</strong></div><div><span>Необъяснённо исчезло</span><strong>${market.unexplainedMissing.toLocaleString("ru-RU")}</strong></div><div><span>Полнота обходов</span><strong>${market.coveragePercent.toFixed(0)}%</strong></div></div>
     <div class="movement-chart-head"><div><span><i class="supply"></i>Предложение</span><span><i class="price"></i>Медианная цена</span></div><small>Покрытие ${market.coveragePercent.toFixed(0)}%</small></div>
     <div id="movement-chart"></div>
-    <div class="movement-events"><div class="movement-section-title"><strong>Последние события</strong><span>Исчезновение не гарантирует продажу</span></div><div class="movement-events-scroll"><table><thead><tr><th>Событие</th><th>Время</th><th>Количество</th><th>Цена / шт.</th><th>Время жизни</th></tr></thead><tbody>${events}</tbody></table></div></div>`;
+    <div class="movement-events"><div class="movement-section-title"><strong>Последние события</strong><span>Исчезновение не гарантирует продажу</span></div><div class="movement-events-scroll"><table><thead><tr><th>Событие</th><th>Время</th><th>Вариант</th><th>Количество</th><th>Цена / шт.</th><th>Время жизни</th></tr></thead><tbody>${events}</tbody></table></div></div>`;
   renderMovementChart(market);
 }
 
@@ -1176,14 +1185,26 @@ function renderMovement() {
 }
 
 async function loadMovement() {
+  const qualities = [...document.querySelectorAll<HTMLInputElement>("#movement-quality-options input:checked")].map((checkbox) => checkbox.value);
+  const minUpgrade = numberValue("movement-min-upgrade");
+  const maxUpgrade = numberValue("movement-max-upgrade");
+  if (minUpgrade != null && maxUpgrade != null && minUpgrade > maxUpgrade) {
+    toast("Минимальная заточка не может быть больше максимальной", true);
+    return;
+  }
   $("#movement-load").classList.add("busy");
   try {
     const response = await invoke<MarketMovementResponse>("market_movement", {
       hours: Number($<HTMLSelectElement>("#movement-hours").value),
       region: $<HTMLSelectElement>("#movement-region").value,
+      qualities,
+      minUpgrade: minUpgrade ?? null,
+      maxUpgrade: maxUpgrade ?? null,
     });
     movementMarkets = response.markets;
-    $("#movement-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · локальная база`;
+    const qualityLabels = qualities.map((value) => artifactQualities.find((quality) => quality.value === value)?.label).filter(Boolean);
+    const variant = [...qualityLabels, describeRange("заточка", minUpgrade, maxUpgrade, "+")].filter(Boolean).join(", ");
+    $("#movement-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · ${variant || "все варианты"}`;
     renderMovement();
   } catch (error) { toast(String(error), true); log(String(error), true); }
   finally { $("#movement-load").classList.remove("busy"); }
@@ -1458,6 +1479,14 @@ $("#scanner-list").addEventListener("click", (event) => {
 });
 $("#movement-load").addEventListener("click", () => void loadMovement());
 ["movement-hours", "movement-region"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", () => void loadMovement()));
+$("#movement-quality-options").addEventListener("change", () => void loadMovement());
+["movement-min-upgrade", "movement-max-upgrade"].forEach((id) => input(id).addEventListener("change", () => void loadMovement()));
+$("#movement-reset-variant").addEventListener("click", () => {
+  document.querySelectorAll<HTMLInputElement>("#movement-quality-options input").forEach((checkbox) => checkbox.checked = false);
+  input("movement-min-upgrade").value = "";
+  input("movement-max-upgrade").value = "";
+  void loadMovement();
+});
 input("movement-search").addEventListener("input", renderMovement);
 $("#movement-list").addEventListener("click", (event) => {
   const row = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-item-id]");

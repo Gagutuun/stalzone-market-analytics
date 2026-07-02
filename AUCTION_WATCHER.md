@@ -41,6 +41,10 @@ The market movement tab reads only the local collector database. For 24-hour,
 disappeared lots, average observed lifetime, collection coverage, market-state
 signals, and a recent lifecycle event log. A disappeared lot is not presented as
 a confirmed sale because the public auction response does not expose that fact.
+Artifact rarity and upgrade filters recalculate the complete movement view,
+including historical chart points, supply, price statistics, official sales,
+lot lifecycles, and events. Existing local observations are filtered through
+their stored lot metadata, so a new collection is not required.
 
 Missing lots are reconciled with official sales using a one-to-one probabilistic
 match over item, region, amount, price, artifact quality, upgrade level, and a

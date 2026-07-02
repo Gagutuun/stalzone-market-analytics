@@ -167,8 +167,23 @@ struct MovementEvent {
     amount: i64,
     buyout: Option<i64>,
     unit_price: Option<f64>,
+    quality: Option<String>,
+    upgrade: Option<i64>,
     lifetime_minutes: Option<f64>,
     confidence: Option<f64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MovementFilters {
+    quality_mask: i64,
+    min_upgrade: Option<i64>,
+    max_upgrade: Option<i64>,
+}
+
+impl MovementFilters {
+    fn active(self) -> bool {
+        self.quality_mask != 0 || self.min_upgrade.is_some() || self.max_upgrade.is_some()
+    }
 }
 
 #[derive(Serialize)]
@@ -787,6 +802,14 @@ fn quality_name(code: i64) -> Option<&'static str> {
     }
 }
 
+fn quality_code(name: &str) -> Option<i64> {
+    match name.to_ascii_lowercase().as_str() {
+        "common" => Some(0), "uncommon" => Some(1), "special" => Some(2),
+        "rare" => Some(3), "exceptional" => Some(4), "legendary" => Some(5),
+        _ => None,
+    }
+}
+
 fn quality_label(code: i64) -> Option<&'static str> {
     match code {
         0 => Some("Обычный"), 1 => Some("Необычный"), 2 => Some("Особый"),
@@ -1030,27 +1053,59 @@ async fn sales_history(item_id: String, region: String, limit: usize, source: St
     Ok(history_response(total, &raw_rows))
 }
 
-fn collection_unit_prices(connection: &Connection, collection_id: i64) -> Result<Vec<f64>, String> {
+fn collection_market_values(
+    connection: &Connection,
+    collection_id: i64,
+    filters: MovementFilters,
+) -> Result<(i64, Vec<f64>), String> {
     let mut statement = connection.prepare(
-        "SELECT CAST(buyout_price AS REAL) / amount FROM lot_observations
-         WHERE collection_id = ?1 AND buyout_price > 0 AND amount > 0"
+        "SELECT CASE WHEN o.buyout_price > 0 AND o.amount > 0
+                     THEN CAST(o.buyout_price AS REAL) / o.amount END
+         FROM lot_observations o LEFT JOIN tracked_lots t ON t.lot_key = o.lot_key
+         WHERE o.collection_id = ?1
+           AND (?2 = 0 OR (t.quality_code IS NOT NULL AND (?2 & (1 << t.quality_code)) != 0))
+           AND (?3 IS NULL OR t.upgrade >= ?3)
+           AND (?4 IS NULL OR t.upgrade <= ?4)"
     ).map_err(|error| error.to_string())?;
-    let rows = statement.query_map(params![collection_id], |row| row.get::<_, f64>(0))
+    let rows = statement.query_map(
+        params![collection_id, filters.quality_mask, filters.min_upgrade, filters.max_upgrade],
+        |row| row.get::<_, Option<f64>>(0)
+    )
         .map_err(|error| error.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
+    let values: Vec<Option<f64>> = rows.filter_map(Result::ok).collect();
+    Ok((values.len() as i64, values.into_iter().flatten().collect()))
 }
 
 #[tauri::command]
-fn market_movement(hours: i64, region: String) -> Result<MarketMovementResponse, String> {
+fn market_movement(
+    hours: i64,
+    region: String,
+    qualities: Vec<String>,
+    min_upgrade: Option<i64>,
+    max_upgrade: Option<i64>,
+) -> Result<MarketMovementResponse, String> {
+    if min_upgrade.is_some_and(|value| !(0..=15).contains(&value))
+        || max_upgrade.is_some_and(|value| !(0..=15).contains(&value)) {
+        return Err("Заточка должна быть в диапазоне от 0 до 15".into());
+    }
+    if min_upgrade.zip(max_upgrade).is_some_and(|(min, max)| min > max) {
+        return Err("Минимальная заточка не может быть больше максимальной".into());
+    }
+    let filters = MovementFilters {
+        quality_mask: qualities.iter().filter_map(|name| quality_code(name)).fold(0, |mask, code| mask | (1 << code)),
+        min_upgrade,
+        max_upgrade,
+    };
     reconcile_all_sale_matches()?;
     let connection = open_cache()?;
-    market_movement_from(&connection, hours, region, chrono::Utc::now())
+    market_movement_from(&connection, hours, region, filters, chrono::Utc::now())
 }
 
 fn market_movement_from(
     connection: &Connection,
     hours: i64,
     region: String,
+    filters: MovementFilters,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<MarketMovementResponse, String> {
     let hours = match hours { 24 | 168 | 720 => hours, _ => 24 };
@@ -1096,8 +1151,9 @@ fn market_movement_from(
         };
         let mut points = Vec::new();
         let mut last_collected = String::new();
-        for (collection_id, collected_at, timestamp, supply) in sampled_collections {
-            let prices = collection_unit_prices(connection, collection_id)?;
+        for (collection_id, collected_at, timestamp, api_supply) in sampled_collections {
+            let (filtered_supply, prices) = collection_market_values(connection, collection_id, filters)?;
+            let supply = if filters.active() { filtered_supply } else { api_supply };
             last_collected = collected_at;
             points.push(MovementPoint {
                 time: timestamp,
@@ -1107,77 +1163,98 @@ fn market_movement_from(
             });
         }
         let appeared = connection.query_row(
-            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND first_seen_timestamp >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND first_seen_timestamp >= ?3
+             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let disappeared = connection.query_row(
-            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND missing_since_timestamp >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND missing_since_timestamp >= ?3
+             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let official_sales = connection.query_row(
-            "SELECT COUNT(*) FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+            "SELECT COUNT(*) FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3
+             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let probable_sales = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2
-             AND status = 'probable_sold' AND missing_since_timestamp >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+             AND status = 'probable_sold' AND missing_since_timestamp >= ?3
+             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let unexplained_missing = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2
-             AND status = 'missing' AND missing_since_timestamp >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+             AND status = 'missing' AND missing_since_timestamp >= ?3
+             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let ended = connection.query_row(
-            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'ended' AND end_timestamp >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'ended' AND end_timestamp >= ?3
+             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let active_lots = connection.query_row(
-            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'active'",
-            params![&item_id, &market_region], |row| row.get::<_, u64>(0)
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'active'
+             AND (?3 = 0 OR (quality_code IS NOT NULL AND (?3 & (1 << quality_code)) != 0))
+             AND (?4 IS NULL OR upgrade >= ?4) AND (?5 IS NULL OR upgrade <= ?5)",
+            params![&item_id, &market_region, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let average_lifetime_minutes = connection.query_row(
             "SELECT AVG(CASE
                WHEN status IN ('missing', 'probable_sold') THEN missing_since_timestamp - first_seen_timestamp
                WHEN status = 'ended' THEN end_timestamp - first_seen_timestamp END) / 60.0
              FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status IN ('missing', 'probable_sold', 'ended')
-               AND COALESCE(missing_since_timestamp, end_timestamp) >= ?3",
-            params![&item_id, &market_region, cutoff], |row| row.get::<_, Option<f64>>(0)
+               AND COALESCE(missing_since_timestamp, end_timestamp) >= ?3
+               AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+               AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, Option<f64>>(0)
         ).unwrap_or(None);
         let mut events = Vec::new();
         {
             let mut statement = connection.prepare(
                 "SELECT t.first_seen_at, t.first_seen_timestamp, t.missing_since_at, t.missing_since_timestamp,
-                        t.status, t.end_time, t.end_timestamp, t.amount, t.buyout_price, m.confidence, s.sold_at
+                        t.status, t.end_time, t.end_timestamp, t.amount, t.buyout_price, m.confidence, s.sold_at,
+                        t.quality_code, t.upgrade
                  FROM tracked_lots t
                  LEFT JOIN lot_sale_matches m ON m.lot_key = t.lot_key
                  LEFT JOIN sales s ON s.fingerprint = m.sale_fingerprint
                  WHERE t.item_id = ?1 AND t.region = ?2
                    AND (first_seen_timestamp >= ?3 OR missing_since_timestamp >= ?3
                         OR (status = 'ended' AND end_timestamp >= ?3))
+                   AND (?4 = 0 OR (t.quality_code IS NOT NULL AND (?4 & (1 << t.quality_code)) != 0))
+                   AND (?5 IS NULL OR t.upgrade >= ?5) AND (?6 IS NULL OR t.upgrade <= ?6)
                  ORDER BY MAX(first_seen_timestamp, COALESCE(missing_since_timestamp, 0), COALESCE(end_timestamp, 0)) DESC
                  LIMIT 100"
             ).map_err(|error| error.to_string())?;
-            type EventRow = (String, i64, Option<String>, Option<i64>, String, Option<String>, Option<i64>, i64, Option<i64>, Option<f64>, Option<String>);
-            let rows = statement.query_map(params![&item_id, &market_region, cutoff], |row| Ok(EventRow::from((
+            type EventRow = (String, i64, Option<String>, Option<i64>, String, Option<String>, Option<i64>, i64, Option<i64>, Option<f64>, Option<String>, Option<i64>, Option<i64>);
+            let rows = statement.query_map(params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| Ok(EventRow::from((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
+                row.get(11)?, row.get(12)?
             )))).map_err(|error| error.to_string())?;
             for row in rows.filter_map(Result::ok) {
-                let (first_at, first_ts, missing_at, missing_ts, status, end_at, end_ts, amount, buyout, confidence, sold_at) = row;
+                let (first_at, first_ts, missing_at, missing_ts, status, end_at, end_ts, amount, buyout, confidence, sold_at, quality_code, upgrade) = row;
                 let unit_price = buyout.filter(|price| *price > 0).filter(|_| amount > 0).map(|price| price as f64 / amount as f64);
+                let quality = quality_code.and_then(quality_label).map(str::to_string);
                 if first_ts >= cutoff {
-                    events.push(MovementEvent { kind: "appeared".into(), time: first_at, amount, buyout, unit_price, lifetime_minutes: None, confidence: None });
+                    events.push(MovementEvent { kind: "appeared".into(), time: first_at, amount, buyout, unit_price, quality: quality.clone(), upgrade, lifetime_minutes: None, confidence: None });
                 }
                 if status == "missing" || status == "probable_sold" {
                     if let (Some(time), Some(timestamp)) = (missing_at, missing_ts) {
                         events.push(MovementEvent { kind: if status == "probable_sold" { "probable_sale".into() } else { "missing".into() },
-                            time: sold_at.unwrap_or(time), amount, buyout, unit_price,
+                            time: sold_at.unwrap_or(time), amount, buyout, unit_price, quality: quality.clone(), upgrade,
                             lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0), confidence });
                     }
                 } else if status == "ended" {
                     if let (Some(time), Some(timestamp)) = (end_at, end_ts) {
-                        events.push(MovementEvent { kind: "ended".into(), time, amount, buyout, unit_price,
+                        events.push(MovementEvent { kind: "ended".into(), time, amount, buyout, unit_price, quality, upgrade,
                             lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0), confidence: None });
                     }
                 }
@@ -1191,6 +1268,11 @@ fn market_movement_from(
             (start.supply > 0).then_some((current.supply - start.supply) as f64 / start.supply as f64 * 100.0));
         let price_change_percent = first.and_then(|point| point.median_unit).zip(last.and_then(|point| point.median_unit))
             .and_then(|(start, current)| (start > 0.0).then_some((current - start) / start * 100.0));
+        if filters.active()
+            && points.iter().all(|point| point.supply == 0)
+            && appeared + disappeared + official_sales + probable_sales + unexplained_missing + ended + active_lots == 0 {
+            continue;
+        }
         let signal = if points.len() < 2 {
             "Нужно больше данных"
         } else if supply_change_percent.is_some_and(|value| value <= -10.0) && price_change_percent.is_some_and(|value| value >= 5.0) {
@@ -1686,7 +1768,7 @@ mod tests {
                 (now - chrono::Duration::minutes(5)).to_rfc3339(), now.timestamp() - 300]
         ).unwrap();
 
-        let response = market_movement_from(&connection, 24, "all".into(), now).expect("movement response");
+        let response = market_movement_from(&connection, 24, "all".into(), MovementFilters::default(), now).expect("movement response");
         assert_eq!(response.markets.len(), 1);
         let market = &response.markets[0];
         assert_eq!(market.current_supply, 8);
@@ -1697,6 +1779,55 @@ mod tests {
         assert_eq!(market.coverage_percent, 100.0);
         assert_eq!(market.signal, "Дефицит усиливается");
         assert!(market.events.iter().any(|event| event.kind == "missing"));
+    }
+
+    #[test]
+    fn movement_filters_artifact_quality_and_upgrade_across_metrics() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (pass, timestamp) in [now.timestamp() - 3_600, now.timestamp()].into_iter().enumerate() {
+            connection.execute(
+                "INSERT INTO market_collections
+                 (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+                 VALUES (?1, ?2, 'artifact', 'RU', 2, 2, 1)",
+                params![chrono::DateTime::from_timestamp(timestamp, 0).unwrap().to_rfc3339(), timestamp]
+            ).unwrap();
+            let collection_id = connection.last_insert_rowid();
+            for (index, (quality, upgrade, price)) in [(2, 15, 100 + pass as i64 * 20), (4, 15, 1_000 + pass as i64 * 200)].into_iter().enumerate() {
+                let lot_key = format!("{pass}-{index}");
+                connection.execute(
+                    "INSERT INTO tracked_lots
+                     (lot_key, item_id, region, first_seen_at, first_seen_timestamp, last_seen_at, last_seen_timestamp,
+                      status, observation_count, amount, buyout_price, quality_code, upgrade, raw_json)
+                     VALUES (?1, 'artifact', 'RU', ?2, ?3, ?2, ?3, 'active', 1, 1, ?4, ?5, ?6, '{}')",
+                    params![&lot_key, chrono::DateTime::from_timestamp(timestamp, 0).unwrap().to_rfc3339(), timestamp, price, quality, upgrade]
+                ).unwrap();
+                connection.execute(
+                    "INSERT INTO lot_observations
+                     (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                     VALUES (?1, ?2, 'artifact', 'RU', 1, ?3, '{}')",
+                    params![collection_id, &lot_key, price]
+                ).unwrap();
+            }
+        }
+        for (fingerprint, quality, price) in [("special", 2, 120), ("exceptional", 4, 1_200)] {
+            connection.execute(
+                "INSERT INTO sales
+                 (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json)
+                 VALUES (?1, 'artifact', 'RU', ?2, ?3, 1, ?4, ?5, 15, '{}')",
+                params![fingerprint, now.to_rfc3339(), now.timestamp(), price, quality]
+            ).unwrap();
+        }
+
+        let filters = MovementFilters { quality_mask: 1 << 2, min_upgrade: Some(15), max_upgrade: Some(15) };
+        let response = market_movement_from(&connection, 24, "RU".into(), filters, now).expect("filtered movement");
+        let market = &response.markets[0];
+        assert_eq!(market.current_supply, 1);
+        assert_eq!(market.current_median_unit, Some(120.0));
+        assert_eq!(market.official_sales, 1);
+        assert_eq!(market.active_lots, 2);
+        assert!(market.events.iter().all(|event| event.quality.as_deref() == Some("Особый") && event.upgrade == Some(15)));
     }
 
     #[test]
