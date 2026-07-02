@@ -31,6 +31,11 @@ opportunities using discount to the sales median, sales velocity, price spread,
 and sample size. Each signal includes P25/median/P75 price zones, trend,
 liquidity, active supply, matching lots, and explicit risk indicators.
 
+The recommendations block converts those metrics into an explicit action:
+buy now, sell now, wait for a dip, hold, or treat the market as risky. It also
+uses 24-hour local supply movement when available, explains the decision, and
+can prepare a new purchase rule with a suggested unit-price range.
+
 The market movement tab reads only the local collector database. For 24-hour,
 7-day, and 30-day periods it shows supply and median-price charts, appeared and
 disappeared lots, average observed lifetime, collection coverage, market-state

@@ -3,15 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { ColorType, createChart, LineSeries, type IChartApi, type UTCTimestamp } from "lightweight-charts";
 import {
-  Activity, BarChart3, Bell, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, createIcons,
+  Activity, BadgeDollarSign, BarChart3, Bell, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, createIcons,
   ChartLine, CircleDollarSign, Database, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
-  RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, X,
+  Hand, Hourglass, RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, ShoppingCart, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, TriangleAlert, X,
 } from "lucide";
 
 const appIcons = {
-  Activity, BarChart3, Bell, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, Database,
+  Activity, BadgeDollarSign, BarChart3, Bell, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, Database,
   CircleDollarSign, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
-  RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, X,
+  Hand, Hourglass, RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, ShoppingCart, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, TriangleAlert, X,
 };
 
 type CatalogItem = {
@@ -102,6 +102,11 @@ type MarketMovement = {
   lastCollected: string; signal: string; points: MovementPoint[]; events: MovementEvent[];
 };
 type MarketMovementResponse = { generatedAt: string; hours: number; markets: MarketMovement[] };
+type RecommendationAction = "buy" | "sell" | "wait" | "hold" | "risk";
+type MarketRecommendation = {
+  insight: MarketInsight; action: RecommendationAction; title: string; summary: string;
+  reasons: string[]; targetLow?: number; targetHigh?: number; confidence: "Высокая" | "Средняя" | "Низкая";
+};
 type CacheStatus = {
   sales: number; snapshots: number; items: number; collections: number; lotObservations: number;
   trackedLots: number; activeLots: number; trackedMarkets: number; lastCollection?: string;
@@ -278,6 +283,10 @@ app.innerHTML = `
           <div><i data-lucide="trending-up"></i><span>Ликвидных рынков</span><strong id="analytics-liquid">—</strong><small>высокая скорость продаж</small></div>
           <div><i data-lucide="gauge"></i><span>Подходящих лотов</span><strong id="analytics-matches">—</strong><small>по активным правилам</small></div>
         </section>
+        <section class="recommendation-section">
+          <header><div><span class="eyebrow">Решение</span><h3>Рекомендации</h3></div><small id="recommendation-context">На основе цены, тренда, ликвидности и движения предложения</small></header>
+          <div id="recommendation-list" class="recommendation-list"><div class="recommendation-empty">Рекомендации появятся после расчёта аналитики</div></div>
+        </section>
         <section class="analytics-toolbar">
           <label><span>Регион</span><select id="analytics-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
           <label><span>Сигнал</span><select id="analytics-signal"><option value="all">Все</option><option value="strong">Сильные</option><option value="interesting">Интересные</option><option value="risk">С риском</option></select></label>
@@ -360,6 +369,7 @@ let historyDisplayMode: "chart" | "table" = "chart";
 let historyChart: IChartApi | undefined;
 let historyResizeObserver: ResizeObserver | undefined;
 let analyticsInsights: MarketInsight[] = [];
+let recommendationMovements: MarketMovement[] = [];
 let movementMarkets: MarketMovement[] = [];
 let selectedMovementKey: string | undefined;
 let movementChart: IChartApi | undefined;
@@ -805,6 +815,76 @@ async function refreshCacheStatus() {
   } catch (error) { log(`Локальная база: ${String(error)}`, true); }
 }
 
+function roundRecommendationPrice(price: number) {
+  const step = price >= 1_000_000 ? 10_000 : price >= 100_000 ? 1_000 : 100;
+  return Math.max(step, Math.round(price / step) * step);
+}
+
+function recommendationFor(insight: MarketInsight): MarketRecommendation {
+  const movement = recommendationMovements.find((item) => item.itemId === insight.itemId && item.region === insight.region);
+  const discount = insight.discountPercent ?? 0;
+  const trend = insight.trendPercent ?? 0;
+  const volatility = insight.volatilityPercent ?? 0;
+  const supplyChange = movement?.supplyChangePercent;
+  const priceMovement = movement?.priceChangePercent;
+  const oversupply = supplyChange != null && supplyChange >= 15 && (priceMovement ?? 0) <= 0;
+  const weakData = insight.salesSample < 30;
+  const highRisk = weakData || volatility >= 40 || (insight.liquidity === "Низкая" && insight.risks.length > 0);
+  let action: RecommendationAction;
+  if (highRisk && discount < 20) action = "risk";
+  else if (discount >= 12 && insight.opportunityScore >= 60 && insight.liquidity !== "Низкая" && !oversupply && trend >= -5) action = "buy";
+  else if (discount <= -8 && insight.liquidity !== "Низкая") action = "sell";
+  else if (oversupply || (discount < 8 && trend <= 0)) action = "wait";
+  else if (trend >= 5 && !oversupply) action = "hold";
+  else action = "wait";
+
+  const labels: Record<RecommendationAction, [string, string]> = {
+    buy: ["Купить сейчас", "Цена заметно ниже справедливой, а рынок способен поглотить предложение."],
+    sell: ["Продать сейчас", "Текущая рыночная цена выше исторического ориентира."],
+    wait: ["Ждать просадки", "Запас выгоды недостаточен для уверенного входа."],
+    hold: ["Держать", "Цена сохраняет положительный импульс без явного давления предложения."],
+    risk: ["Рискованно", "Данных или ликвидности недостаточно для надёжного решения."],
+  };
+  const reasons = [
+    insight.currentMinUnit != null && insight.medianUnit != null
+      ? `Минимум ${money(insight.currentMinUnit)} ₽/шт., справедливая цена ${money(insight.medianUnit)} ₽/шт., отклонение ${signedPercent(discount)}.`
+      : "Недостаточно данных для сравнения с медианой.",
+    `Тренд ${signedPercent(insight.trendPercent)}, ликвидность ${insight.liquidity.toLocaleLowerCase("ru")}, разброс ${signedPercent(insight.volatilityPercent)}.`,
+  ];
+  if (supplyChange != null) reasons.push(`Предложение за 24 часа ${signedPercent(supplyChange)}, медианная цена ${signedPercent(priceMovement)}.`);
+  if (insight.risks.length) reasons.push(`Риски: ${insight.risks.join(", ").toLocaleLowerCase("ru")}.`);
+  const fair = insight.medianUnit;
+  const targetLow = fair == null ? undefined : roundRecommendationPrice(Math.max(fair * .75, Math.min(insight.p25Unit ?? fair * .85, fair * .85)));
+  const targetHigh = fair == null ? undefined : roundRecommendationPrice(fair * .9);
+  const confidence = insight.salesSample >= 100 && (movement?.collections ?? 0) >= 5 && volatility < 30
+    ? "Высокая" : insight.salesSample >= 30 && volatility < 45 ? "Средняя" : "Низкая";
+  return { insight, action, title: labels[action][0], summary: labels[action][1], reasons, targetLow, targetHigh, confidence };
+}
+
+function renderRecommendations(region: string) {
+  const actionMeta: Record<RecommendationAction, { icon: string; priority: number }> = {
+    buy: { icon: "shopping-cart", priority: 5 }, sell: { icon: "badge-dollar-sign", priority: 4 },
+    wait: { icon: "hourglass", priority: 3 }, hold: { icon: "hand", priority: 2 }, risk: { icon: "triangle-alert", priority: 1 },
+  };
+  const recommendations = analyticsInsights.filter((item) => region === "all" || item.region === region)
+    .map(recommendationFor)
+    .sort((a, b) => actionMeta[b.action].priority - actionMeta[a.action].priority || b.insight.opportunityScore - a.insight.opportunityScore)
+    .slice(0, 8);
+  $("#recommendation-context").textContent = recommendationMovements.length
+    ? "Цена, история продаж и движение предложения за 24 часа"
+    : "Цена, история продаж, тренд и ликвидность";
+  $("#recommendation-list").innerHTML = recommendations.map((item) => {
+    const target = item.targetLow != null && item.targetHigh != null ? `${money(item.targetLow)}–${money(item.targetHigh)} ₽/шт.` : "Недостаточно данных";
+    return `<article class="recommendation-card ${item.action}" data-recommendation-id="${escapeHtml(item.insight.itemId)}" data-recommendation-region="${escapeHtml(item.insight.region)}" data-target-high="${item.targetHigh ?? ""}">
+      <div class="recommendation-heading"><span class="recommendation-icon"><i data-lucide="${actionMeta[item.action].icon}"></i></span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)}</small></div><span class="recommendation-action">${escapeHtml(item.title)}</span></div>
+      <p>${escapeHtml(item.summary)}</p>
+      <div class="recommendation-reasons">${item.reasons.slice(0, 3).map((reason) => `<span>${escapeHtml(reason)}</span>`).join("")}</div>
+      <footer><div><span>Цена для правила</span><strong>${target}</strong><small>Уверенность: ${item.confidence.toLocaleLowerCase("ru")}</small></div><button class="secondary recommendation-rule"><i data-lucide="plus"></i> Создать правило</button></footer>
+    </article>`;
+  }).join("") || `<div class="recommendation-empty">Нет рекомендаций по выбранному региону</div>`;
+  createIcons({ icons: appIcons });
+}
+
 function renderAnalytics() {
   const discounts = analyticsInsights.map((item) => item.discountPercent).filter((value): value is number => value != null);
   const best = analyticsInsights[0];
@@ -815,6 +895,7 @@ function renderAnalytics() {
   $("#analytics-matches").textContent = analyticsInsights.length ? String(analyticsInsights.reduce((sum, item) => sum + item.matchingLots, 0)) : "—";
 
   const region = $<HTMLSelectElement>("#analytics-region").value;
+  renderRecommendations(region);
   const signal = $<HTMLSelectElement>("#analytics-signal").value;
   const sort = $<HTMLSelectElement>("#analytics-sort").value;
   const liquidityRank: Record<string, number> = { "Высокая": 3, "Средняя": 2, "Низкая": 1 };
@@ -857,6 +938,10 @@ async function loadAnalytics() {
   try {
     const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules: analysisRules });
     analyticsInsights = response.insights;
+    try {
+      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all" });
+      recommendationMovements = movement.markets;
+    } catch { recommendationMovements = []; }
     $("#analytics-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
     renderAnalytics();
     $(".workspace").scrollTop = 0;
@@ -1223,6 +1308,28 @@ $("#movement-list").addEventListener("click", (event) => {
   if (!row) return;
   selectedMovementKey = `${row.dataset.region}|${row.dataset.itemId}`;
   renderMovement();
+});
+$("#recommendation-list").addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest(".recommendation-rule");
+  const card = (event.target as HTMLElement).closest<HTMLElement>("[data-recommendation-id]");
+  if (!button || !card) return;
+  const itemId = card.dataset.recommendationId!;
+  const region = card.dataset.recommendationRegion!;
+  const item = catalog.find((candidate) => candidate.id === itemId);
+  const source = rules.find((rule) => rule.region === region && (rule.itemId === itemId || rule.itemIds?.includes(itemId)));
+  const draft: Rule = {
+    ...(source || { name: item?.nameRu || item?.nameEn || itemId, itemId, region }),
+    name: `${item?.nameRu || item?.nameEn || itemId} · покупка`, itemId, region,
+    scope: "item", category: undefined, itemIds: undefined, topN: undefined, groupId: undefined, groupTopN: undefined,
+  };
+  editingIndex = undefined;
+  setForm(draft);
+  const targetHigh = Number(card.dataset.targetHigh);
+  if (Number.isFinite(targetHigh) && targetHigh > 0) input("max-unit").value = String(targetHigh);
+  input("history-percent").value = "90";
+  switchView("config");
+  renderRules();
+  toast("Черновик правила подготовлен");
 });
 $("#analytics-list").addEventListener("click", (event) => {
   const card = (event.target as HTMLElement).closest<HTMLElement>("[data-insight-id]"); if (!card) return;
