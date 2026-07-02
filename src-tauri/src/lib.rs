@@ -1,17 +1,20 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, USER_AGENT};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
 };
 
-const API_BASE: &str = "https://eapi.stalcraft.net";
+const API_BASE: &str = "https://eapi.stalzone.com";
 const ITEMS_BASE: &str = "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main";
 const CONFIG_FILE: &str = "auction_watchlist.json";
 const STATE_FILE: &str = ".auction_seen.json";
+const CACHE_FILE: &str = "market_cache.sqlite3";
 
 struct AppState {
     check_lock: tokio::sync::Mutex<()>,
@@ -211,6 +214,128 @@ fn existing_workspace_file(name: &str) -> PathBuf {
         if legacy.exists() { return legacy; }
     }
     primary
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheStatus {
+    sales: u64,
+    snapshots: u64,
+    items: u64,
+    oldest_sale: Option<String>,
+    newest_sale: Option<String>,
+    size_bytes: u64,
+    path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheSyncResponse {
+    inserted_sales: usize,
+    cached_sales: u64,
+    cached_items: u64,
+    fetched_pages: usize,
+}
+
+fn open_cache() -> Result<Connection, String> {
+    let path = workspace_file(CACHE_FILE);
+    let connection = Connection::open(&path).map_err(|error| format!("Не удалось открыть локальную базу: {error}"))?;
+    connection.busy_timeout(std::time::Duration::from_secs(5)).map_err(|error| error.to_string())?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         CREATE TABLE IF NOT EXISTS sales (
+           fingerprint TEXT PRIMARY KEY,
+           item_id TEXT NOT NULL,
+           region TEXT NOT NULL,
+           sold_at TEXT NOT NULL,
+           sold_timestamp INTEGER NOT NULL,
+           amount INTEGER NOT NULL,
+           price INTEGER NOT NULL,
+           quality_code INTEGER,
+           upgrade INTEGER,
+           raw_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS sales_item_time ON sales(item_id, region, sold_timestamp DESC);
+         CREATE TABLE IF NOT EXISTS market_snapshots (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           captured_at TEXT NOT NULL,
+           captured_timestamp INTEGER NOT NULL,
+           item_id TEXT NOT NULL,
+           region TEXT NOT NULL,
+           active_lots INTEGER NOT NULL,
+           buyout_lots INTEGER NOT NULL,
+           matching_lots INTEGER NOT NULL,
+           total_amount INTEGER NOT NULL,
+           min_unit REAL,
+           second_min_unit REAL,
+           median_unit REAL
+         );
+         CREATE INDEX IF NOT EXISTS snapshots_item_time ON market_snapshots(item_id, region, captured_timestamp DESC);"
+    ).map_err(|error| format!("Не удалось подготовить локальную базу: {error}"))?;
+    Ok(connection)
+}
+
+fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usize, String> {
+    let mut connection = open_cache()?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let mut inserted = 0;
+    {
+        let mut statement = transaction.prepare(
+            "INSERT OR IGNORE INTO sales
+             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        ).map_err(|error| error.to_string())?;
+        for row in rows {
+            let Some(time) = row.get("time").and_then(Value::as_str) else { continue };
+            let Some(timestamp) = chrono::DateTime::parse_from_rfc3339(time).ok().map(|value| value.timestamp()) else { continue };
+            let Some(row_price) = price(row, "price").filter(|value| *value > 0) else { continue };
+            let raw = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            let fingerprint = format!("{:x}", Sha256::digest(format!("{region}|{item_id}|{raw}").as_bytes()));
+            inserted += statement.execute(params![
+                fingerprint, item_id, region, time, timestamp, amount(row), row_price,
+                lot_quality_code(row), lot_upgrade(row), raw
+            ]).map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(inserted)
+}
+
+fn load_cached_history(item_id: &str, region: &str, days: i64, limit: usize) -> Result<Vec<Value>, String> {
+    let connection = open_cache()?;
+    let cutoff = chrono::Utc::now().timestamp() - days.max(1) * 86_400;
+    let mut statement = connection.prepare(
+        "SELECT raw_json FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3
+         ORDER BY sold_timestamp DESC LIMIT ?4"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![item_id, region, cutoff, limit as i64], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    Ok(rows.filter_map(Result::ok).filter_map(|raw| serde_json::from_str(&raw).ok()).collect())
+}
+
+fn cached_oldest_timestamp(item_id: &str, region: &str) -> Result<Option<i64>, String> {
+    let connection = open_cache()?;
+    connection.query_row(
+        "SELECT MIN(sold_timestamp) FROM sales WHERE item_id = ?1 AND region = ?2",
+        params![item_id, region], |row| row.get(0)
+    ).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cache_status() -> Result<CacheStatus, String> {
+    let path = workspace_file(CACHE_FILE);
+    let connection = open_cache()?;
+    let sales = connection.query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let snapshots = connection.query_row("SELECT COUNT(*) FROM market_snapshots", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let items = connection.query_row("SELECT COUNT(DISTINCT item_id || '|' || region) FROM sales", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let oldest_sale = connection.query_row("SELECT MIN(sold_at) FROM sales", [], |row| row.get::<_, Option<String>>(0)).unwrap_or(None);
+    let newest_sale = connection.query_row("SELECT MAX(sold_at) FROM sales", [], |row| row.get::<_, Option<String>>(0)).unwrap_or(None);
+    Ok(CacheStatus {
+        sales, snapshots, items, oldest_sale, newest_sale,
+        size_bytes: fs::metadata(&path).map(|meta| meta.len()).unwrap_or_default(),
+        path: path.display().to_string(),
+    })
 }
 
 fn env_candidates() -> Vec<PathBuf> {
@@ -443,15 +568,35 @@ fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     Some(sorted[lower] * (1.0 - weight) + sorted[upper] * weight)
 }
 
-async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value>, String> {
+fn save_market_snapshot(rule: &WatchRule, lots: &[Value], matching_lots: usize) -> Result<(), String> {
+    let comparable: Vec<&Value> = lots.iter().filter(|lot| variant_matches(rule, lot)).collect();
+    let mut units: Vec<f64> = comparable.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
+    units.sort_by(f64::total_cmp);
+    let now = chrono::Utc::now();
+    let connection = open_cache()?;
+    let previous: Option<i64> = connection.query_row(
+        "SELECT MAX(captured_timestamp) FROM market_snapshots WHERE item_id = ?1 AND region = ?2",
+        params![rule.item_id, rule.region], |row| row.get(0)
+    ).unwrap_or(None);
+    if previous.is_some_and(|timestamp| now.timestamp() - timestamp < 30) { return Ok(()); }
+    connection.execute(
+        "INSERT INTO market_snapshots
+         (captured_at, captured_timestamp, item_id, region, active_lots, buyout_lots, matching_lots, total_amount, min_unit, second_min_unit, median_unit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            now.to_rfc3339(), now.timestamp(), rule.item_id, rule.region,
+            comparable.len() as i64, units.len() as i64, matching_lots as i64,
+            comparable.iter().map(|lot| amount(lot)).sum::<i64>(),
+            units.first().copied(), units.get(1).copied(), median(&units)
+        ]
+    ).map_err(|error| format!("Не удалось сохранить снимок рынка: {error}"))?;
+    Ok(())
+}
+
+async fn request_history_page(rule: &WatchRule, limit: usize, offset: usize) -> Result<(u64, Vec<Value>), String> {
     let headers = api_headers()?;
-    let endpoint = if history { "history" } else { "lots" };
-    let limit = if history { rule.history_limit } else { rule.limit }.min(200);
-    let mut url = format!("{API_BASE}/{}/auction/{}/{endpoint}?limit={limit}&additional={}",
-        rule.region.to_ascii_uppercase(), urlencoding::encode(&rule.item_id), rule.additional);
-    if !history {
-        url.push_str(&format!("&sort={}&order={}", urlencoding::encode(&rule.sort), urlencoding::encode(&rule.order)));
-    }
+    let url = format!("{API_BASE}/{}/auction/{}/history?limit={}&offset={offset}&additional={}",
+        rule.region.to_ascii_uppercase(), urlencoding::encode(&rule.item_id), limit.clamp(5, 200), rule.additional);
     let response = reqwest::Client::new().get(&url).headers(headers).send().await
         .map_err(|error| format!("Ошибка сети: {error}"))?;
     let status = response.status();
@@ -461,8 +606,65 @@ async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value
         return Err(format!("HTTP {}: {}{}", status.as_u16(), body, hint));
     }
     let payload: Value = serde_json::from_str(&body).map_err(|error| format!("API вернул некорректный JSON: {error}"))?;
-    let key = if history { "prices" } else { "lots" };
-    Ok(payload.get(key).and_then(Value::as_array).cloned().unwrap_or_default())
+    Ok((payload.get("total").and_then(Value::as_u64).unwrap_or_default(),
+        payload.get("prices").and_then(Value::as_array).cloned().unwrap_or_default()))
+}
+
+async fn sync_history_for_rule(rule: &WatchRule) -> Result<(usize, usize), String> {
+    let existing_oldest = cached_oldest_timestamp(&rule.item_id, &rule.region)?;
+    let cutoff = chrono::Utc::now().timestamp() - 30 * 86_400;
+    let initial_pages = if existing_oldest.is_some() { 10 } else { 5 };
+    let mut inserted = 0;
+    let mut fetched_pages = 0;
+    let mut reached_existing_on: Option<usize> = None;
+    for page in 0..initial_pages {
+        let offset = page * 200;
+        let (total, rows) = request_history_page(rule, 200, offset).await?;
+        fetched_pages += 1;
+        if rows.is_empty() { break; }
+        inserted += save_history_rows(&rule.item_id, &rule.region, &rows)?;
+        let oldest_in_page = rows.iter().filter_map(|row| row.get("time").and_then(Value::as_str))
+            .filter_map(|time| chrono::DateTime::parse_from_rfc3339(time).ok().map(|value| value.timestamp())).min();
+        if let (Some(cached_oldest), Some(page_oldest)) = (existing_oldest, oldest_in_page) {
+            if reached_existing_on.is_none() && page_oldest <= cached_oldest { reached_existing_on = Some(page); }
+        }
+        if reached_existing_on.is_some_and(|reached| page > reached) { break; }
+        if oldest_in_page.is_some_and(|timestamp| timestamp <= cutoff) { break; }
+        if offset + rows.len() >= total as usize { break; }
+    }
+    Ok((inserted, fetched_pages))
+}
+
+#[tauri::command]
+async fn sync_market_cache(rules: Vec<WatchRule>) -> Result<CacheSyncResponse, String> {
+    let mut inserted_sales = 0;
+    let mut fetched_pages = 0;
+    for rule in &rules {
+        let (inserted, pages) = sync_history_for_rule(rule).await?;
+        inserted_sales += inserted;
+        fetched_pages += pages;
+    }
+    let status = cache_status()?;
+    Ok(CacheSyncResponse { inserted_sales, cached_sales: status.sales, cached_items: status.items, fetched_pages })
+}
+
+async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value>, String> {
+    if history { return Ok(request_history_page(rule, rule.history_limit, 0).await?.1); }
+    let headers = api_headers()?;
+    let limit = rule.limit.min(200);
+    let url = format!("{API_BASE}/{}/auction/{}/lots?limit={limit}&additional={}&sort={}&order={}",
+        rule.region.to_ascii_uppercase(), urlencoding::encode(&rule.item_id), rule.additional,
+        urlencoding::encode(&rule.sort), urlencoding::encode(&rule.order));
+    let response = reqwest::Client::new().get(&url).headers(headers).send().await
+        .map_err(|error| format!("Ошибка сети: {error}"))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let hint = if status.as_u16() == 401 { " Проверьте Client ID и Client Secret в .env." } else { "" };
+        return Err(format!("HTTP {}: {}{}", status.as_u16(), body, hint));
+    }
+    let payload: Value = serde_json::from_str(&body).map_err(|error| format!("API вернул некорректный JSON: {error}"))?;
+    Ok(payload.get("lots").and_then(Value::as_array).cloned().unwrap_or_default())
 }
 
 #[tauri::command]
@@ -494,7 +696,9 @@ async fn sales_history(item_id: String, region: String, limit: usize) -> Result<
     if !status.is_success() { return Err(format!("HTTP {}: {}", status.as_u16(), body)); }
     let payload: Value = serde_json::from_str(&body).map_err(|error| format!("API вернул некорректный JSON: {error}"))?;
     let total = payload.get("total").and_then(Value::as_u64).unwrap_or_default();
-    let entries = payload.get("prices").and_then(Value::as_array).into_iter().flatten().filter_map(|row| {
+    let raw_rows = payload.get("prices").and_then(Value::as_array).cloned().unwrap_or_default();
+    save_history_rows(item_id.trim(), &region, &raw_rows)?;
+    let entries = raw_rows.iter().filter_map(|row| {
         let amount = amount(row);
         let price = price(row, "price")?;
         if amount <= 0 { return None; }
@@ -517,7 +721,8 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
         rule.limit = 200;
         rule.history_limit = 200;
         let lots = request_collection(&rule, false).await?;
-        let history = request_collection(&rule, true).await?;
+        sync_history_for_rule(&rule).await?;
+        let history = load_cached_history(&rule.item_id, &rule.region, 30, 20_000)?;
         let comparable_lots: Vec<&Value> = lots.iter().filter(|lot| variant_matches(&rule, lot)).collect();
         let comparable_history: Vec<&Value> = history.iter().filter(|lot| variant_matches(&rule, lot)).collect();
         let current_units: Vec<f64> = comparable_lots.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
@@ -568,6 +773,7 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
         if comparable_lots.len() <= 2 { risks.push("Мало активных предложений".into()); }
 
         let matching_lots = comparable_lots.iter().filter(|lot| lot_matches(&rule, lot, &current_units, history_median)).count();
+        save_market_snapshot(&rule, &lots, matching_lots)?;
         insights.push(MarketInsight {
             name: rule.name, item_id: rule.item_id, region: rule.region,
             active_lots: comparable_lots.len(), matching_lots, sales_sample: history_units.len(),
@@ -658,6 +864,7 @@ async fn check_rules(
         } else { None };
         let comparable: Vec<&Value> = lots.iter().filter(|lot| variant_matches(rule, lot)).collect();
         let matching_lots = comparable.iter().filter(|lot| lot_matches(rule, lot, &current, history_median)).count();
+        save_market_snapshot(rule, &lots, matching_lots)?;
         summaries.push(RuleSummary {
             name: rule.name.clone(), item_id: rule.item_id.clone(), region: rule.region.clone(),
             total_lots: lots.len(), comparable_lots: comparable.len(), matching_lots,
@@ -714,7 +921,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { check_lock: tokio::sync::Mutex::new(()) })
-        .invoke_handler(tauri::generate_handler![credentials_status, load_catalog, read_image, analyze_market, sales_history, market_analytics, check_rules, load_rules, save_rules])
+        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, market_analytics, check_rules, load_rules, save_rules])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }

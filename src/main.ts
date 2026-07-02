@@ -85,6 +85,7 @@ type MarketInsight = {
   verdict: string; risks: string[];
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
+type CacheStatus = { sales: number; snapshots: number; items: number; oldestSale?: string; newestSale?: string; sizeBytes: number; path: string };
 
 type ArtifactQuality = "common" | "uncommon" | "special" | "rare" | "exceptional" | "legendary";
 const artifactQualities: { value: ArtifactQuality; label: string }[] = [
@@ -229,6 +230,10 @@ app.innerHTML = `
         <section class="analytics-head">
           <div><span class="eyebrow">Рыночные сигналы</span><h2>Полезная аналитика</h2><small id="analytics-updated">Используются предметы из активных правил</small></div>
           <button id="analytics-load" class="primary"><i data-lucide="refresh-cw"></i> Рассчитать</button>
+        </section>
+        <section class="cache-strip" id="cache-strip" title="Локальный рыночный архив">
+          <i data-lucide="database"></i><div><strong id="cache-summary">Локальная база подготавливается</strong><span id="cache-range">Продажи будут накапливаться автоматически</span></div>
+          <small id="cache-size">—</small>
         </section>
         <section class="analytics-stats">
           <div><i data-lucide="sparkles"></i><span>Лучший сигнал</span><strong id="analytics-best">—</strong><small id="analytics-best-name">нет расчёта</small></div>
@@ -576,6 +581,7 @@ async function loadSalesHistory() {
     historyEntries = response.entries; historyTotal = response.total;
     $("#history-subtitle").textContent = `${response.total.toLocaleString("ru-RU")} продаж в API · загружено ${response.entries.length}`;
     renderSalesHistory();
+    await refreshCacheStatus();
   } catch (error) { toast(String(error), true); log(String(error), true); }
   finally { $("#history-load").classList.remove("busy"); }
 }
@@ -599,6 +605,23 @@ function formatInterval(minutes?: number) {
   if (minutes < 60) return `${Math.round(minutes)} мин`;
   if (minutes < 1440) return `${(minutes / 60).toFixed(1)} ч`;
   return `${(minutes / 1440).toFixed(1)} дн`;
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} КБ`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+}
+
+async function refreshCacheStatus() {
+  try {
+    const status = await invoke<CacheStatus>("cache_status");
+    $("#cache-summary").textContent = `${status.sales.toLocaleString("ru-RU")} продаж · ${status.items} предметов · ${status.snapshots} снимков рынка`;
+    $("#cache-range").textContent = status.oldestSale && status.newestSale
+      ? `${new Date(status.oldestSale).toLocaleDateString("ru-RU")} — ${new Date(status.newestSale).toLocaleDateString("ru-RU")}`
+      : "Архив начнёт заполняться при первом расчёте";
+    $("#cache-size").textContent = formatBytes(status.sizeBytes);
+    $("#cache-strip").title = status.path;
+  } catch (error) { log(`Локальная база: ${String(error)}`, true); }
 }
 
 function renderAnalytics() {
@@ -655,6 +678,7 @@ async function loadAnalytics() {
     $("#analytics-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
     renderAnalytics();
     $(".workspace").scrollTop = 0;
+    await refreshCacheStatus();
   } catch (error) { toast(String(error), true); log(String(error), true); $("#analytics-updated").textContent = "Не удалось рассчитать аналитику"; }
   finally { $("#analytics-load").classList.remove("busy"); }
 }
@@ -877,7 +901,7 @@ async function initialize() {
     const config = await invoke<{ defaults?: { region?: string }; items?: Rule[] }>("load_rules");
     rules = config.items || []; if (config.defaults?.region) $<HTMLSelectElement>("#region").value = config.defaults.region;
   } catch (error) { log(String(error), true); }
-  renderRules(); createIcons({ icons: appIcons }); await loadCatalog();
+  renderRules(); createIcons({ icons: appIcons }); await Promise.all([loadCatalog(), refreshCacheStatus()]);
 }
 
 void initialize();

@@ -23,6 +23,8 @@ dotenvy = "0.15"
 urlencoding = "2"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 
 [profile.dev]
 debug = 0
