@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -167,6 +167,9 @@ struct MatchRecord {
 struct CheckResult {
     checked_rules: usize,
     notifications: usize,
+    observed_lots: usize,
+    collected_sales: usize,
+    collection_errors: Vec<String>,
     matches: Vec<MatchRecord>,
     summaries: Vec<RuleSummary>,
 }
@@ -222,6 +225,12 @@ struct CacheStatus {
     sales: u64,
     snapshots: u64,
     items: u64,
+    collections: u64,
+    lot_observations: u64,
+    tracked_lots: u64,
+    active_lots: u64,
+    tracked_markets: u64,
+    last_collection: Option<String>,
     oldest_sale: Option<String>,
     newest_sale: Option<String>,
     size_bytes: u64,
@@ -276,7 +285,62 @@ fn prepare_cache(connection: &Connection) -> Result<(), String> {
            second_min_unit REAL,
            median_unit REAL
          );
-         CREATE INDEX IF NOT EXISTS snapshots_item_time ON market_snapshots(item_id, region, captured_timestamp DESC);"
+         CREATE INDEX IF NOT EXISTS snapshots_item_time ON market_snapshots(item_id, region, captured_timestamp DESC);
+         CREATE TABLE IF NOT EXISTS market_collections (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           collected_at TEXT NOT NULL,
+           collected_timestamp INTEGER NOT NULL,
+           item_id TEXT NOT NULL,
+           region TEXT NOT NULL,
+           api_total INTEGER NOT NULL,
+           returned_lots INTEGER NOT NULL,
+           complete INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS collections_market_time ON market_collections(item_id, region, collected_timestamp DESC);
+         CREATE TABLE IF NOT EXISTS tracked_lots (
+           lot_key TEXT PRIMARY KEY,
+           item_id TEXT NOT NULL,
+           region TEXT NOT NULL,
+           first_seen_at TEXT NOT NULL,
+           first_seen_timestamp INTEGER NOT NULL,
+           last_seen_at TEXT NOT NULL,
+           last_seen_timestamp INTEGER NOT NULL,
+           missing_since_at TEXT,
+           missing_since_timestamp INTEGER,
+           status TEXT NOT NULL,
+           observation_count INTEGER NOT NULL,
+           amount INTEGER NOT NULL,
+           start_price INTEGER,
+           current_price INTEGER,
+           buyout_price INTEGER,
+           start_time TEXT,
+           end_time TEXT,
+           end_timestamp INTEGER,
+           quality_code INTEGER,
+           upgrade INTEGER,
+           raw_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS tracked_lots_market_status ON tracked_lots(item_id, region, status, last_seen_timestamp DESC);
+         CREATE TABLE IF NOT EXISTS lot_observations (
+           collection_id INTEGER NOT NULL,
+           lot_key TEXT NOT NULL,
+           item_id TEXT NOT NULL,
+           region TEXT NOT NULL,
+           amount INTEGER NOT NULL,
+           start_price INTEGER,
+           current_price INTEGER,
+           buyout_price INTEGER,
+           raw_json TEXT NOT NULL,
+           PRIMARY KEY (collection_id, lot_key),
+           FOREIGN KEY (collection_id) REFERENCES market_collections(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS observations_market ON lot_observations(item_id, region, collection_id);
+         CREATE TABLE IF NOT EXISTS cache_sync_state (
+           item_id TEXT NOT NULL,
+           region TEXT NOT NULL,
+           last_history_sync INTEGER NOT NULL,
+           PRIMARY KEY (item_id, region)
+         );"
     ).map_err(|error| format!("Не удалось подготовить локальную базу: {error}"))?;
     Ok(())
 }
@@ -354,10 +418,17 @@ fn cache_status() -> Result<CacheStatus, String> {
     let sales = connection.query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
     let snapshots = connection.query_row("SELECT COUNT(*) FROM market_snapshots", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
     let items = connection.query_row("SELECT COUNT(DISTINCT item_id || '|' || region) FROM sales", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let collections = connection.query_row("SELECT COUNT(*) FROM market_collections", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let lot_observations = connection.query_row("SELECT COUNT(*) FROM lot_observations", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let tracked_lots = connection.query_row("SELECT COUNT(*) FROM tracked_lots", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let active_lots = connection.query_row("SELECT COUNT(*) FROM tracked_lots WHERE status = 'active'", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let tracked_markets = connection.query_row("SELECT COUNT(DISTINCT item_id || '|' || region) FROM market_collections", [], |row| row.get::<_, u64>(0)).unwrap_or_default();
+    let last_collection = connection.query_row("SELECT MAX(collected_at) FROM market_collections", [], |row| row.get::<_, Option<String>>(0)).unwrap_or(None);
     let oldest_sale = connection.query_row("SELECT MIN(sold_at) FROM sales", [], |row| row.get::<_, Option<String>>(0)).unwrap_or(None);
     let newest_sale = connection.query_row("SELECT MAX(sold_at) FROM sales", [], |row| row.get::<_, Option<String>>(0)).unwrap_or(None);
     Ok(CacheStatus {
-        sales, snapshots, items, oldest_sale, newest_sale,
+        sales, snapshots, items, collections, lot_observations, tracked_lots,
+        active_lots, tracked_markets, last_collection, oldest_sale, newest_sale,
         size_bytes: fs::metadata(&path).map(|meta| meta.len()).unwrap_or_default(),
         path: path.display().to_string(),
     })
@@ -683,11 +754,10 @@ async fn sync_market_cache(rules: Vec<WatchRule>) -> Result<CacheSyncResponse, S
     Ok(CacheSyncResponse { inserted_sales, cached_sales: status.sales, cached_items: status.items, fetched_pages })
 }
 
-async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value>, String> {
-    if history { return Ok(request_history_page(rule, rule.history_limit, 0).await?.1); }
+async fn request_lots_page(rule: &WatchRule, limit: usize, offset: usize) -> Result<(u64, Vec<Value>), String> {
     let headers = api_headers()?;
-    let limit = rule.limit.min(200);
-    let url = format!("{API_BASE}/{}/auction/{}/lots?limit={limit}&additional={}&sort={}&order={}",
+    let limit = limit.clamp(5, 200);
+    let url = format!("{API_BASE}/{}/auction/{}/lots?limit={limit}&offset={offset}&additional={}&sort={}&order={}",
         rule.region.to_ascii_uppercase(), urlencoding::encode(&rule.item_id), rule.additional,
         urlencoding::encode(&rule.sort), urlencoding::encode(&rule.order));
     let response = reqwest::Client::new().get(&url).headers(headers).send().await
@@ -699,7 +769,29 @@ async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value
         return Err(format!("HTTP {}: {}{}", status.as_u16(), body, hint));
     }
     let payload: Value = serde_json::from_str(&body).map_err(|error| format!("API вернул некорректный JSON: {error}"))?;
-    Ok(payload.get("lots").and_then(Value::as_array).cloned().unwrap_or_default())
+    Ok((payload.get("total").and_then(Value::as_u64).unwrap_or_default(),
+        payload.get("lots").and_then(Value::as_array).cloned().unwrap_or_default()))
+}
+
+async fn request_lots_for_collection(rule: &WatchRule, cap: usize) -> Result<(u64, Vec<Value>, bool), String> {
+    let cap = cap.clamp(200, 2_000);
+    let mut rows = Vec::new();
+    let mut total = 0;
+    while rows.len() < cap {
+        let remaining = cap - rows.len();
+        let (page_total, page) = request_lots_page(rule, remaining.min(200), rows.len()).await?;
+        total = page_total;
+        if page.is_empty() { break; }
+        rows.extend(page);
+        if rows.len() >= total as usize { break; }
+    }
+    let complete = rows.len() >= total as usize;
+    Ok((total, rows, complete))
+}
+
+async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value>, String> {
+    if history { return Ok(request_history_page(rule, rule.history_limit, 0).await?.1); }
+    Ok(request_lots_page(rule, rule.limit, 0).await?.1)
 }
 
 #[tauri::command]
@@ -848,6 +940,117 @@ fn lot_matches(rule: &WatchRule, lot: &Value, current: &[f64], history_median: O
     true
 }
 
+fn tracked_lot_key(rule: &WatchRule, lot: &Value) -> String {
+    let identity = json!({
+        "region": rule.region.to_ascii_uppercase(),
+        "itemId": rule.item_id,
+        "amount": amount(lot),
+        "startPrice": price(lot, "startPrice"),
+        "buyoutPrice": price(lot, "buyoutPrice"),
+        "startTime": lot.get("startTime"),
+        "endTime": lot.get("endTime"),
+        "additional": lot.get("additional"),
+    });
+    format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+}
+
+fn tracked_lot_keys(rule: &WatchRule, lots: &[Value]) -> Vec<String> {
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    lots.iter().map(|lot| {
+        let base = tracked_lot_key(rule, lot);
+        let occurrence = occurrences.entry(base.clone()).or_default();
+        let key = if *occurrence == 0 { base } else { format!("{base}#{}", *occurrence) };
+        *occurrence += 1;
+        key
+    }).collect()
+}
+
+fn record_market_collection(rule: &WatchRule, lots: &[Value], api_total: u64, complete: bool) -> Result<(), String> {
+    let region = rule.region.to_ascii_uppercase();
+    let now = chrono::Utc::now();
+    let mut connection = open_cache()?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    transaction.execute(
+        "UPDATE tracked_lots SET status = 'ended' WHERE status = 'active' AND end_timestamp IS NOT NULL AND end_timestamp <= ?1",
+        params![now.timestamp()]
+    ).map_err(|error| error.to_string())?;
+    transaction.execute(
+        "INSERT INTO market_collections
+         (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![now.to_rfc3339(), now.timestamp(), rule.item_id, &region, api_total as i64, lots.len() as i64, complete as i64]
+    ).map_err(|error| error.to_string())?;
+    let collection_id = transaction.last_insert_rowid();
+    if complete {
+        transaction.execute(
+            "UPDATE tracked_lots SET status = 'candidate_missing'
+             WHERE item_id = ?1 AND region = ?2 AND status = 'active'",
+            params![rule.item_id, &region]
+        ).map_err(|error| error.to_string())?;
+    }
+    for (lot, key) in lots.iter().zip(tracked_lot_keys(rule, lots)) {
+        let raw = serde_json::to_string(lot).map_err(|error| error.to_string())?;
+        let end_time = lot.get("endTime").and_then(Value::as_str);
+        let end_timestamp = end_time.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()).map(|value| value.timestamp());
+        transaction.execute(
+            "INSERT INTO tracked_lots
+             (lot_key, item_id, region, first_seen_at, first_seen_timestamp, last_seen_at, last_seen_timestamp,
+              status, observation_count, amount, start_price, current_price, buyout_price, start_time, end_time,
+              end_timestamp, quality_code, upgrade, raw_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, 'active', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(lot_key) DO UPDATE SET
+               last_seen_at = excluded.last_seen_at,
+               last_seen_timestamp = excluded.last_seen_timestamp,
+               missing_since_at = NULL,
+               missing_since_timestamp = NULL,
+               status = 'active',
+               observation_count = tracked_lots.observation_count + 1,
+               current_price = excluded.current_price,
+               raw_json = excluded.raw_json",
+            params![
+                &key, rule.item_id, &region, now.to_rfc3339(), now.timestamp(), amount(lot),
+                price(lot, "startPrice"), price(lot, "currentPrice"), price(lot, "buyoutPrice"),
+                lot.get("startTime").and_then(Value::as_str), end_time, end_timestamp,
+                lot_quality_code(lot), lot_upgrade(lot), &raw
+            ]
+        ).map_err(|error| error.to_string())?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO lot_observations
+             (collection_id, lot_key, item_id, region, amount, start_price, current_price, buyout_price, raw_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![collection_id, &key, rule.item_id, &region, amount(lot), price(lot, "startPrice"),
+                price(lot, "currentPrice"), price(lot, "buyoutPrice"), &raw]
+        ).map_err(|error| error.to_string())?;
+    }
+    if complete {
+        transaction.execute(
+            "UPDATE tracked_lots SET status = 'missing', missing_since_at = ?1, missing_since_timestamp = ?2
+             WHERE item_id = ?3 AND region = ?4 AND status = 'candidate_missing'",
+            params![now.to_rfc3339(), now.timestamp(), rule.item_id, &region]
+        ).map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn recent_history_sync_due(item_id: &str, region: &str, now: i64) -> Result<bool, String> {
+    let connection = open_cache()?;
+    let last: Option<i64> = connection.query_row(
+        "SELECT last_history_sync FROM cache_sync_state WHERE item_id = ?1 AND region = ?2",
+        params![item_id, region.to_ascii_uppercase()], |row| row.get(0)
+    ).unwrap_or(None);
+    Ok(last.is_none_or(|timestamp| now - timestamp >= 300))
+}
+
+fn mark_recent_history_synced(item_id: &str, region: &str, now: i64) -> Result<(), String> {
+    let connection = open_cache()?;
+    connection.execute(
+        "INSERT INTO cache_sync_state (item_id, region, last_history_sync) VALUES (?1, ?2, ?3)
+         ON CONFLICT(item_id, region) DO UPDATE SET last_history_sync = excluded.last_history_sync",
+        params![item_id, region.to_ascii_uppercase(), now]
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn lot_key(rule: &WatchRule, lot: &Value) -> String {
     format!("{}|{}|{}|{}|{}|{}|{}|{}", rule.region, rule.item_id, amount(lot),
         lot.get("startTime").unwrap_or(&Value::Null), lot.get("endTime").unwrap_or(&Value::Null),
@@ -896,9 +1099,36 @@ async fn check_rules(
     let mut updated = seen.clone();
     let mut matches = Vec::new();
     let mut summaries = Vec::new();
+    let mut collected_markets: HashMap<String, (u64, Vec<Value>, bool)> = HashMap::new();
+    let mut observed_lots = 0;
+    let mut collected_sales = 0;
+    let mut collection_errors = Vec::new();
 
     for rule in &rules {
-        let lots = request_collection(rule, false).await?;
+        let market_key = format!("{}|{}", rule.region.to_ascii_uppercase(), rule.item_id);
+        if !collected_markets.contains_key(&market_key) {
+            let collection = match request_lots_for_collection(rule, 1_000).await {
+                Ok(collection) => collection,
+                Err(error) => {
+                    collection_errors.push(format!("{} {}: {error}", rule.region.to_ascii_uppercase(), rule.item_id));
+                    continue;
+                }
+            };
+            if let Err(error) = record_market_collection(rule, &collection.1, collection.0, collection.2) {
+                collection_errors.push(format!("{} {}: {error}", rule.region.to_ascii_uppercase(), rule.item_id));
+                continue;
+            }
+            observed_lots += collection.1.len();
+            let now = chrono::Utc::now().timestamp();
+            if recent_history_sync_due(&rule.item_id, &rule.region, now)? {
+                if let Ok((_, rows)) = request_history_page(rule, 200, 0).await {
+                    collected_sales += save_history_rows(&rule.item_id, &rule.region, &rows)?;
+                    mark_recent_history_synced(&rule.item_id, &rule.region, now)?;
+                }
+            }
+            collected_markets.insert(market_key.clone(), collection);
+        }
+        let (api_total, lots, _) = collected_markets.get(&market_key).expect("market was collected");
         let current: Vec<f64> = lots.iter().filter(|lot| variant_matches(rule, lot)).filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
         let history_median = if rule.max_history_median_ratio.is_some() {
             let history = request_collection(rule, true).await?;
@@ -907,16 +1137,16 @@ async fn check_rules(
         } else { None };
         let comparable: Vec<&Value> = lots.iter().filter(|lot| variant_matches(rule, lot)).collect();
         let matching_lots = comparable.iter().filter(|lot| lot_matches(rule, lot, &current, history_median)).count();
-        save_market_snapshot(rule, &lots, matching_lots)?;
+        save_market_snapshot(rule, lots, matching_lots)?;
         summaries.push(RuleSummary {
             name: rule.name.clone(), item_id: rule.item_id.clone(), region: rule.region.clone(),
-            total_lots: lots.len(), comparable_lots: comparable.len(), matching_lots,
+            total_lots: *api_total as usize, comparable_lots: comparable.len(), matching_lots,
             current_min_buyout: comparable.iter().filter_map(|lot| price(lot, "buyoutPrice")).min(),
             current_min_unit: comparable.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).min_by(f64::total_cmp),
             history_median_unit: history_median,
             checked_at: chrono::Utc::now().to_rfc3339(),
         });
-        for lot in &lots {
+        for lot in lots {
             let key = lot_key(rule, lot);
             let already_seen = seen.contains(&key);
             if already_seen && !include_seen { continue; }
@@ -941,7 +1171,10 @@ async fn check_rules(
     seen_state.updated_at = Some(chrono::Utc::now().to_rfc3339());
     fs::write(&state_path, serde_json::to_string_pretty(&seen_state).map_err(|e| e.to_string())?)
         .map_err(|error| format!("Не удалось сохранить состояние: {error}"))?;
-    Ok(CheckResult { checked_rules: rules.len(), notifications: matches.len(), matches, summaries })
+    Ok(CheckResult {
+        checked_rules: rules.len(), notifications: matches.len(), observed_lots, collected_sales,
+        collection_errors, matches, summaries,
+    })
 }
 
 #[tauri::command]
@@ -994,6 +1227,32 @@ mod tests {
     fn zero_buyout_is_not_a_market_price() {
         let lot = json!({"amount": 1, "buyoutPrice": 0});
         assert_eq!(unit_price(&lot, "buyoutPrice"), None);
+    }
+
+    #[test]
+    fn tracked_lot_identity_ignores_changing_bid() {
+        let rule = rule_with_quality("special");
+        let first = json!({
+            "amount": 1, "startPrice": 100, "currentPrice": 150, "buyoutPrice": 500,
+            "startTime": "2026-07-02T08:00:00Z", "endTime": "2026-07-03T08:00:00Z",
+            "additional": {"qlt": 2, "ptn": 15}
+        });
+        let mut changed_bid = first.clone();
+        changed_bid["currentPrice"] = json!(250);
+        assert_eq!(tracked_lot_key(&rule, &first), tracked_lot_key(&rule, &changed_bid));
+    }
+
+    #[test]
+    fn identical_active_lots_get_distinct_occurrence_keys() {
+        let rule = rule_with_quality("special");
+        let lot = json!({
+            "amount": 1, "buyoutPrice": 500,
+            "startTime": "2026-07-02T08:00:00Z", "endTime": "2026-07-03T08:00:00Z",
+            "additional": {"qlt": 2}
+        });
+        let keys = tracked_lot_keys(&rule, &[lot.clone(), lot]);
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
     }
 
     #[test]

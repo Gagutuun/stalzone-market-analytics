@@ -72,7 +72,7 @@ type RuleSummary = {
   checkedAt: string;
 };
 
-type CheckResult = { checkedRules: number; notifications: number; matches: MatchRecord[]; summaries: RuleSummary[] };
+type CheckResult = { checkedRules: number; notifications: number; observedLots: number; collectedSales: number; collectionErrors: string[]; matches: MatchRecord[]; summaries: RuleSummary[] };
 type MarketAnalysis = { lots: number; history: number; currentMin?: number; currentMedian?: number; historyMedian?: number };
 type SalesHistoryEntry = { amount: number; price: number; unitPrice: number; time: string; quality?: string; qualityCode?: number; upgrade?: number };
 type SalesHistoryResponse = { total: number; entries: SalesHistoryEntry[] };
@@ -85,7 +85,11 @@ type MarketInsight = {
   verdict: string; risks: string[];
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
-type CacheStatus = { sales: number; snapshots: number; items: number; oldestSale?: string; newestSale?: string; sizeBytes: number; path: string };
+type CacheStatus = {
+  sales: number; snapshots: number; items: number; collections: number; lotObservations: number;
+  trackedLots: number; activeLots: number; trackedMarkets: number; lastCollection?: string;
+  oldestSale?: string; newestSale?: string; sizeBytes: number; path: string;
+};
 
 type ArtifactQuality = "common" | "uncommon" | "special" | "rare" | "exceptional" | "legendary";
 const artifactQualities: { value: ArtifactQuality; label: string }[] = [
@@ -139,6 +143,10 @@ app.innerHTML = `
         <section class="overview-head">
           <div><span class="eyebrow">Состояние рынка</span><h2>Активные правила</h2></div>
           <div class="overview-actions"><span id="overview-updated">Ещё не проверялось</span><button id="overview-check" class="primary"><i data-lucide="refresh-cw"></i> Обновить рынок</button></div>
+        </section>
+        <section class="cache-strip collector-strip" id="collector-strip" title="Локальный сборщик активного рынка">
+          <i data-lucide="database-zap"></i><div><strong id="collector-summary">Сборщик ещё не запускался</strong><span id="collector-range">Запустите мониторинг, чтобы накапливать жизненный цикл лотов</span></div>
+          <small id="collector-time">—</small>
         </section>
         <section class="overview-stats">
           <div><span>Правил в работе</span><strong id="overview-rules">0</strong><small>в выбранных регионах</small></div>
@@ -637,6 +645,16 @@ async function refreshCacheStatus() {
       : "Архив начнёт заполняться при первом расчёте";
     $("#cache-size").textContent = formatBytes(status.sizeBytes);
     $("#cache-strip").title = status.path;
+    $("#collector-summary").textContent = status.collections
+      ? `${status.trackedMarkets} рынков · ${status.activeLots.toLocaleString("ru-RU")} активных · ${status.trackedLots.toLocaleString("ru-RU")} лотов известно`
+      : "Сборщик ещё не запускался";
+    $("#collector-range").textContent = status.collections
+      ? `${status.lotObservations.toLocaleString("ru-RU")} наблюдений в ${status.collections.toLocaleString("ru-RU")} проходах`
+      : "Запустите мониторинг, чтобы накапливать жизненный цикл лотов";
+    $("#collector-time").textContent = status.lastCollection
+      ? new Date(status.lastCollection).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+      : "—";
+    $("#collector-strip").title = status.path;
   } catch (error) { log(`Локальная база: ${String(error)}`, true); }
 }
 
@@ -768,7 +786,9 @@ async function runCheck(manual = false) {
     $("#stat-time").textContent = new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
     $("#overview-updated").textContent = `Обновлено ${new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
     renderOverview();
-    log(`Проверено правил: ${result.checkedRules}, найдено новых лотов: ${result.notifications}`);
+    log(`Проверено правил: ${result.checkedRules}, наблюдений лотов: ${result.observedLots}, новых продаж в архиве: ${result.collectedSales}, найдено лотов: ${result.notifications}`);
+    result.collectionErrors.forEach((error) => log(`Сборщик пропустил рынок: ${error}`, true));
+    await refreshCacheStatus();
     if (!manual) result.matches.forEach((match) => { void desktopNotify(match); });
     if (result.matches.length) toast(`Найдено лотов: ${result.matches.length}`);
     else if (manual) toast("Проверка завершена, новых лотов нет");

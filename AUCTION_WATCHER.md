@@ -46,6 +46,14 @@ for a standalone build. It is local-only and excluded from Git.
   market key `item_id + region`; region names are normalized to uppercase.
 - Current market supply is stored as timestamped snapshots at most once every
   30 seconds per item and region.
+- While monitoring is active, each unique item/region market is collected once
+  per pass, with pagination up to 1,000 active lots. Individual lot observations
+  are stored with first/last seen timestamps and active/missing/ended status.
+- Missing status is assigned only when the API collection is complete. A market
+  above the 1,000-lot safety cap remains a partial collection and cannot produce
+  false disappearance events.
+- The first page of recent sales is synchronized at most once every five minutes
+  per item and region during monitoring.
 - Analytics currently reads up to 20,000 cached sales from the last 30 days for
   each rule. The raw API response is retained in SQLite for future metrics.
 - The sales history filters include an `API / Local` source switch. Local mode
