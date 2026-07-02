@@ -24,6 +24,11 @@ selected catalog item. Every item can be filtered by sold stack size. Artifact
 history additionally supports rarity and upgrade-level filters, with chart and
 table views and total/unit price modes.
 
+The `Аналитика` tab evaluates the markets referenced by active rules. It ranks
+opportunities using discount to the sales median, sales velocity, price spread,
+and sample size. Each signal includes P25/median/P75 price zones, trend,
+liquidity, active supply, matching lots, and explicit risk indicators.
+
 The Tauri interface reads and writes the existing `auction_watchlist.json` and
 `.auction_seen.json`, so rules and notification deduplication remain compatible
 with the Python version. API credentials are read only by the Rust backend and

@@ -112,6 +112,39 @@ struct SalesHistoryResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MarketInsight {
+    name: String,
+    item_id: String,
+    region: String,
+    active_lots: usize,
+    matching_lots: usize,
+    sales_sample: usize,
+    sold_amount: i64,
+    current_min_unit: Option<f64>,
+    median_unit: Option<f64>,
+    average_unit: Option<f64>,
+    p25_unit: Option<f64>,
+    p75_unit: Option<f64>,
+    discount_percent: Option<f64>,
+    trend_percent: Option<f64>,
+    volatility_percent: Option<f64>,
+    sales_per_day: Option<f64>,
+    average_sale_interval_minutes: Option<f64>,
+    opportunity_score: u8,
+    liquidity: String,
+    verdict: String,
+    risks: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketAnalyticsResponse {
+    generated_at: String,
+    insights: Vec<MarketInsight>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MatchRecord {
     name: String,
     region: String,
@@ -367,7 +400,8 @@ fn amount(lot: &Value) -> i64 { parse_i64(lot.get("amount")).unwrap_or(0) }
 fn price(lot: &Value, key: &str) -> Option<i64> { parse_i64(lot.get(key)) }
 fn unit_price(lot: &Value, key: &str) -> Option<f64> {
     let count = amount(lot);
-    (count > 0).then(|| price(lot, key).map(|value| value as f64 / count as f64)).flatten()
+    let total = price(lot, key)?;
+    (count > 0 && total > 0).then_some(total as f64 / count as f64)
 }
 
 fn variant_matches(rule: &WatchRule, lot: &Value) -> bool {
@@ -395,6 +429,18 @@ fn median(values: &[f64]) -> Option<f64> {
     sorted.sort_by(f64::total_cmp);
     let middle = sorted.len() / 2;
     Some(if sorted.len() % 2 == 1 { sorted[middle] } else { (sorted[middle - 1] + sorted[middle]) / 2.0 })
+}
+
+fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
+    if values.is_empty() { return None; }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let position = percentile.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    if lower == upper { return Some(sorted[lower]); }
+    let weight = position - lower as f64;
+    Some(sorted[lower] * (1.0 - weight) + sorted[upper] * weight)
 }
 
 async fn request_collection(rule: &WatchRule, history: bool) -> Result<Vec<Value>, String> {
@@ -463,9 +509,82 @@ async fn sales_history(item_id: String, region: String, limit: usize) -> Result<
     Ok(SalesHistoryResponse { total, entries })
 }
 
+#[tauri::command]
+async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsResponse, String> {
+    let mut insights = Vec::new();
+    for original_rule in rules {
+        let mut rule = original_rule.clone();
+        rule.limit = 200;
+        rule.history_limit = 200;
+        let lots = request_collection(&rule, false).await?;
+        let history = request_collection(&rule, true).await?;
+        let comparable_lots: Vec<&Value> = lots.iter().filter(|lot| variant_matches(&rule, lot)).collect();
+        let comparable_history: Vec<&Value> = history.iter().filter(|lot| variant_matches(&rule, lot)).collect();
+        let current_units: Vec<f64> = comparable_lots.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
+        let history_units: Vec<f64> = comparable_history.iter().filter_map(|lot| unit_price(lot, "price")).collect();
+        let current_min = current_units.iter().copied().min_by(f64::total_cmp);
+        let history_median = median(&history_units);
+        let average = (!history_units.is_empty()).then(|| history_units.iter().sum::<f64>() / history_units.len() as f64);
+        let p25 = percentile(&history_units, 0.25);
+        let p75 = percentile(&history_units, 0.75);
+        let discount = current_min.zip(history_median).and_then(|(current, market)|
+            (market > 0.0).then_some((market - current) / market * 100.0));
+        let volatility = p25.zip(p75).zip(history_median).and_then(|((low, high), market)|
+            (market > 0.0).then_some((high - low) / market * 100.0));
+
+        let mut timed_prices: Vec<(i64, f64)> = comparable_history.iter().filter_map(|row| {
+            let time = row.get("time").and_then(Value::as_str)?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(time).ok()?.timestamp();
+            Some((timestamp, unit_price(row, "price")?))
+        }).collect();
+        timed_prices.sort_by(|a, b| b.0.cmp(&a.0));
+        let middle = timed_prices.len() / 2;
+        let newest: Vec<f64> = timed_prices.iter().take(middle.max(1)).map(|(_, price)| *price).collect();
+        let older: Vec<f64> = timed_prices.iter().skip(middle.max(1)).map(|(_, price)| *price).collect();
+        let trend = median(&newest).zip(median(&older)).and_then(|(recent, previous)|
+            (previous > 0.0).then_some((recent - previous) / previous * 100.0));
+        let span_seconds = timed_prices.first().zip(timed_prices.last()).map(|(newest, oldest)| (newest.0 - oldest.0).abs() as f64);
+        let average_interval = span_seconds.and_then(|span|
+            (timed_prices.len() > 1).then_some(span / (timed_prices.len() - 1) as f64 / 60.0));
+        let sales_per_day = span_seconds.and_then(|span|
+            (span > 0.0).then_some((timed_prices.len().saturating_sub(1)) as f64 / (span / 86_400.0)));
+        let liquidity = match sales_per_day.unwrap_or_default() {
+            value if value >= 8.0 => "Высокая",
+            value if value >= 2.0 => "Средняя",
+            _ => "Низкая",
+        }.to_string();
+
+        let discount_points = discount.unwrap_or_default().max(0.0).min(22.0) / 22.0 * 55.0;
+        let liquidity_points = match liquidity.as_str() { "Высокая" => 25.0, "Средняя" => 16.0, _ => 6.0 };
+        let stability_points = (15.0 - volatility.unwrap_or(30.0) * 0.35).max(0.0);
+        let sample_points = if history_units.len() >= 100 { 5.0 } else if history_units.len() >= 30 { 3.0 } else { 0.0 };
+        let score = (discount_points + liquidity_points + stability_points + sample_points).round().clamp(0.0, 100.0) as u8;
+        let verdict = match score { 75..=100 => "Сильная возможность", 55..=74 => "Интересно", 35..=54 => "Наблюдать", _ => "Слабый сигнал" }.to_string();
+        let mut risks = Vec::new();
+        if history_units.len() < 30 { risks.push("Мало данных".into()); }
+        if volatility.is_some_and(|value| value > 35.0) { risks.push("Высокий разброс цены".into()); }
+        if liquidity == "Низкая" { risks.push("Медленные продажи".into()); }
+        if discount.is_some_and(|value| value < 0.0) { risks.push("Минимум выше медианы".into()); }
+        if comparable_lots.len() <= 2 { risks.push("Мало активных предложений".into()); }
+
+        let matching_lots = comparable_lots.iter().filter(|lot| lot_matches(&rule, lot, &current_units, history_median)).count();
+        insights.push(MarketInsight {
+            name: rule.name, item_id: rule.item_id, region: rule.region,
+            active_lots: comparable_lots.len(), matching_lots, sales_sample: history_units.len(),
+            sold_amount: comparable_history.iter().map(|row| amount(row)).sum(),
+            current_min_unit: current_min, median_unit: history_median, average_unit: average,
+            p25_unit: p25, p75_unit: p75, discount_percent: discount, trend_percent: trend,
+            volatility_percent: volatility, sales_per_day, average_sale_interval_minutes: average_interval,
+            opportunity_score: score, liquidity, verdict, risks,
+        });
+    }
+    insights.sort_by(|a, b| b.opportunity_score.cmp(&a.opportunity_score));
+    Ok(MarketAnalyticsResponse { generated_at: chrono::Utc::now().to_rfc3339(), insights })
+}
+
 fn lot_matches(rule: &WatchRule, lot: &Value, current: &[f64], history_median: Option<f64>) -> bool {
     if !variant_matches(rule, lot) { return false; }
-    let buyout = price(lot, "buyoutPrice");
+    let buyout = price(lot, "buyoutPrice").filter(|value| *value > 0);
     let unit = unit_price(lot, "buyoutPrice");
     if rule.max_buyout.is_some_and(|max| buyout.is_none_or(|value| value > max)) { return false; }
     if rule.max_unit_buyout.is_some_and(|max| unit.is_none_or(|value| value > max as f64)) { return false; }
@@ -489,7 +608,7 @@ fn lot_key(rule: &WatchRule, lot: &Value) -> String {
 
 fn format_lot(rule: &WatchRule, lot: &Value) -> String {
     let count = amount(lot);
-    let buyout = price(lot, "buyoutPrice");
+    let buyout = price(lot, "buyoutPrice").filter(|value| *value > 0);
     let mut lines = vec![format!("Новый лот: {}", rule.name), format!("Регион: {}", rule.region),
         format!("Item ID: {}", rule.item_id), format!("Количество: {count}"),
         format!("Выкуп: {}", buyout.map(|v| v.to_string()).unwrap_or_else(|| "нет".into()))];
@@ -559,7 +678,7 @@ async fn check_rules(
                     name: rule.name.clone(), region: rule.region.clone(), item_id: rule.item_id.clone(),
                     quality: lot_quality_code(lot).and_then(quality_label).map(str::to_string),
                     upgrade: lot_upgrade(lot), amount: amount(lot),
-                    buyout: price(lot, "buyoutPrice"), unit: unit_price(lot, "buyoutPrice"),
+                    buyout: price(lot, "buyoutPrice").filter(|value| *value > 0), unit: unit_price(lot, "buyoutPrice"),
                     current: price(lot, "currentPrice"), end: lot.get("endTime").and_then(Value::as_str).unwrap_or_default().into(), message,
                 });
             }
@@ -595,7 +714,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { check_lock: tokio::sync::Mutex::new(()) })
-        .invoke_handler(tauri::generate_handler![credentials_status, load_catalog, read_image, analyze_market, sales_history, check_rules, load_rules, save_rules])
+        .invoke_handler(tauri::generate_handler![credentials_status, load_catalog, read_image, analyze_market, sales_history, market_analytics, check_rules, load_rules, save_rules])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }
@@ -619,5 +738,11 @@ mod tests {
         assert!(variant_matches(&rule_with_quality("special"), &lot));
         assert!(!variant_matches(&rule_with_quality("rare"), &lot));
         assert_eq!(lot_quality_code(&lot).and_then(quality_label), Some("Особый"));
+    }
+
+    #[test]
+    fn zero_buyout_is_not_a_market_price() {
+        let lot = json!({"amount": 1, "buyoutPrice": 0});
+        assert_eq!(unit_price(&lot, "buyoutPrice"), None);
     }
 }

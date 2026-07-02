@@ -4,14 +4,14 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { ColorType, createChart, LineSeries, type IChartApi, type UTCTimestamp } from "lightweight-charts";
 import {
   BarChart3, Bell, ChartNoAxesCombined, Check, ChevronRight, Coins, createIcons,
-  ChartLine, Database, DatabaseZap, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
-  RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Square, Table2, Trash2, X,
+  ChartLine, CircleDollarSign, Database, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
+  RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, X,
 } from "lucide";
 
 const appIcons = {
   BarChart3, Bell, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Coins, Database,
-  DatabaseZap, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
-  RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Square, Table2, Trash2, X,
+  CircleDollarSign, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
+  RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, X,
 };
 
 type CatalogItem = {
@@ -76,6 +76,15 @@ type CheckResult = { checkedRules: number; notifications: number; matches: Match
 type MarketAnalysis = { lots: number; history: number; currentMin?: number; currentMedian?: number; historyMedian?: number };
 type SalesHistoryEntry = { amount: number; price: number; unitPrice: number; time: string; quality?: string; qualityCode?: number; upgrade?: number };
 type SalesHistoryResponse = { total: number; entries: SalesHistoryEntry[] };
+type MarketInsight = {
+  name: string; itemId: string; region: string; activeLots: number; matchingLots: number;
+  salesSample: number; soldAmount: number; currentMinUnit?: number; medianUnit?: number;
+  averageUnit?: number; p25Unit?: number; p75Unit?: number; discountPercent?: number;
+  trendPercent?: number; volatilityPercent?: number; salesPerDay?: number;
+  averageSaleIntervalMinutes?: number; opportunityScore: number; liquidity: string;
+  verdict: string; risks: string[];
+};
+type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
 
 type ArtifactQuality = "common" | "uncommon" | "special" | "rare" | "exceptional" | "legendary";
 const artifactQualities: { value: ArtifactQuality; label: string }[] = [
@@ -122,6 +131,7 @@ app.innerHTML = `
         <button class="active" data-view="overview"><i data-lucide="layout-dashboard"></i> Обзор рынка</button>
         <button data-view="config"><i data-lucide="sliders-horizontal"></i> Правила и фильтры</button>
         <button data-view="history"><i data-lucide="history"></i> История продаж</button>
+        <button data-view="analytics"><i data-lucide="sparkles"></i> Аналитика</button>
       </nav>
 
       <div id="overview-view" class="workspace-view">
@@ -214,6 +224,25 @@ app.innerHTML = `
         <section id="history-table-wrap" class="history-data hidden"><div class="history-table-scroll"><table><thead><tr><th>Время</th><th class="history-quality-column">Редкость</th><th class="history-quality-column">Заточка</th><th>Количество</th><th>За лот</th><th>За штуку</th></tr></thead><tbody id="history-table-body"></tbody></table></div></section>
         <a class="chart-attribution" href="https://www.tradingview.com" target="_blank" rel="noreferrer">Charts by TradingView</a>
       </div>
+
+      <div id="analytics-view" class="workspace-view hidden">
+        <section class="analytics-head">
+          <div><span class="eyebrow">Рыночные сигналы</span><h2>Полезная аналитика</h2><small id="analytics-updated">Используются предметы из активных правил</small></div>
+          <button id="analytics-load" class="primary"><i data-lucide="refresh-cw"></i> Рассчитать</button>
+        </section>
+        <section class="analytics-stats">
+          <div><i data-lucide="sparkles"></i><span>Лучший сигнал</span><strong id="analytics-best">—</strong><small id="analytics-best-name">нет расчёта</small></div>
+          <div><i data-lucide="circle-dollar-sign"></i><span>Средняя скидка</span><strong id="analytics-discount">—</strong><small>к медиане продаж</small></div>
+          <div><i data-lucide="trending-up"></i><span>Ликвидных рынков</span><strong id="analytics-liquid">—</strong><small>высокая скорость продаж</small></div>
+          <div><i data-lucide="gauge"></i><span>Подходящих лотов</span><strong id="analytics-matches">—</strong><small>по активным правилам</small></div>
+        </section>
+        <section class="analytics-toolbar">
+          <label><span>Регион</span><select id="analytics-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
+          <label><span>Сигнал</span><select id="analytics-signal"><option value="all">Все</option><option value="strong">Сильные</option><option value="interesting">Интересные</option><option value="risk">С риском</option></select></label>
+          <label><span>Сортировка</span><select id="analytics-sort"><option value="score">Индекс возможности</option><option value="discount">Скидка</option><option value="liquidity">Ликвидность</option><option value="trend">Рост цены</option></select></label>
+        </section>
+        <section id="analytics-list" class="analytics-list"><div class="analytics-empty"><i data-lucide="sparkles"></i><strong>Рассчитайте рыночные сигналы</strong><span>Нужны активные правила и доступ к API</span></div></section>
+      </div>
     </main>
 
     <aside class="monitor-panel">
@@ -259,6 +288,7 @@ let historyPriceMode: "total" | "unit" = "total";
 let historyDisplayMode: "chart" | "table" = "chart";
 let historyChart: IChartApi | undefined;
 let historyResizeObserver: ResizeObserver | undefined;
+let analyticsInsights: MarketInsight[] = [];
 
 function toast(message: string, danger = false) {
   const element = $("#toast");
@@ -359,10 +389,11 @@ function describeRule(rule: Rule) {
   ].filter(Boolean).join(" · ") || "Без ценовых ограничений";
 }
 
-function switchView(view: "overview" | "config" | "history") {
+function switchView(view: "overview" | "config" | "history" | "analytics") {
   $("#overview-view").classList.toggle("hidden", view !== "overview");
   $("#config-view").classList.toggle("hidden", view !== "config");
   $("#history-view").classList.toggle("hidden", view !== "history");
+  $("#analytics-view").classList.toggle("hidden", view !== "analytics");
   document.querySelectorAll<HTMLButtonElement>(".workspace-tabs button").forEach((button) =>
     button.classList.toggle("active", button.dataset.view === view));
   $(".workspace").scrollTop = 0;
@@ -557,6 +588,77 @@ function openHistory(item: CatalogItem) {
   switchView("history"); renderSalesHistory(); void loadSalesHistory();
 }
 
+function signedPercent(value?: number) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `${value > 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function formatInterval(minutes?: number) {
+  if (minutes == null || !Number.isFinite(minutes)) return "—";
+  if (minutes < 1) return "<1 мин";
+  if (minutes < 60) return `${Math.round(minutes)} мин`;
+  if (minutes < 1440) return `${(minutes / 60).toFixed(1)} ч`;
+  return `${(minutes / 1440).toFixed(1)} дн`;
+}
+
+function renderAnalytics() {
+  const discounts = analyticsInsights.map((item) => item.discountPercent).filter((value): value is number => value != null);
+  const best = analyticsInsights[0];
+  $("#analytics-best").textContent = best ? `${best.opportunityScore}/100` : "—";
+  $("#analytics-best-name").textContent = best?.name || "нет расчёта";
+  $("#analytics-discount").textContent = discounts.length ? signedPercent(discounts.reduce((sum, value) => sum + value, 0) / discounts.length) : "—";
+  $("#analytics-liquid").textContent = analyticsInsights.length ? String(analyticsInsights.filter((item) => item.liquidity === "Высокая").length) : "—";
+  $("#analytics-matches").textContent = analyticsInsights.length ? String(analyticsInsights.reduce((sum, item) => sum + item.matchingLots, 0)) : "—";
+
+  const region = $<HTMLSelectElement>("#analytics-region").value;
+  const signal = $<HTMLSelectElement>("#analytics-signal").value;
+  const sort = $<HTMLSelectElement>("#analytics-sort").value;
+  const liquidityRank: Record<string, number> = { "Высокая": 3, "Средняя": 2, "Низкая": 1 };
+  const filtered = analyticsInsights.filter((item) => {
+    if (region !== "all" && item.region !== region) return false;
+    if (signal === "strong" && item.opportunityScore < 75) return false;
+    if (signal === "interesting" && (item.opportunityScore < 55 || item.opportunityScore >= 75)) return false;
+    if (signal === "risk" && !item.risks.length) return false;
+    return true;
+  }).sort((a, b) => {
+    if (sort === "discount") return (b.discountPercent ?? -Infinity) - (a.discountPercent ?? -Infinity);
+    if (sort === "liquidity") return (liquidityRank[b.liquidity] || 0) - (liquidityRank[a.liquidity] || 0);
+    if (sort === "trend") return (b.trendPercent ?? -Infinity) - (a.trendPercent ?? -Infinity);
+    return b.opportunityScore - a.opportunityScore;
+  });
+
+  $("#analytics-list").innerHTML = filtered.map((item) => {
+    const scoreClass = item.opportunityScore >= 75 ? "strong" : item.opportunityScore >= 55 ? "interesting" : item.opportunityScore >= 35 ? "watch" : "weak";
+    const discountClass = (item.discountPercent ?? 0) > 0 ? "positive" : "negative";
+    const trendClass = (item.trendPercent ?? 0) > 0 ? "positive" : (item.trendPercent ?? 0) < 0 ? "negative" : "";
+    return `<article class="insight-card ${scoreClass}" data-insight-id="${escapeHtml(item.itemId)}" data-insight-region="${escapeHtml(item.region)}">
+      <div class="insight-heading"><span class="rule-region">${escapeHtml(item.region)}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.itemId)} · ${item.salesSample} продаж в расчёте</small></div></div>
+      <div class="score-box ${scoreClass}"><strong>${item.opportunityScore}</strong><span>${escapeHtml(item.verdict)}</span></div>
+      <div class="insight-actions"><button class="icon-button small insight-history" title="Открыть историю продаж"><i data-lucide="history"></i></button><button class="icon-button small insight-edit" title="Изменить правило"><i data-lucide="pencil"></i></button></div>
+      <div class="insight-signal"><div><span>Текущий минимум</span><strong>${money(item.currentMinUnit)} ₽/шт.</strong></div><div><span>Справедливая цена</span><strong>${money(item.medianUnit)} ₽/шт.</strong></div><div><span>Скидка к медиане</span><strong class="${discountClass}">${signedPercent(item.discountPercent)}</strong></div></div>
+      <div class="opportunity-track"><span class="${scoreClass}" style="width:${item.opportunityScore}%"></span></div>
+      <div class="price-zones"><div><span>Зона покупки · P25</span><strong>${money(item.p25Unit)} ₽</strong></div><div><span>Медиана</span><strong>${money(item.medianUnit)} ₽</strong></div><div><span>Дорогая зона · P75</span><strong>${money(item.p75Unit)} ₽</strong></div></div>
+      <div class="insight-metrics"><div><span>Тренд</span><strong class="${trendClass}">${signedPercent(item.trendPercent)}</strong></div><div><span>Разброс цены</span><strong>${signedPercent(item.volatilityPercent)}</strong></div><div><span>Продаж в день</span><strong>${item.salesPerDay == null ? "—" : item.salesPerDay.toFixed(1)}</strong></div><div><span>Интервал продажи</span><strong>${formatInterval(item.averageSaleIntervalMinutes)}</strong></div><div><span>Ликвидность</span><strong>${escapeHtml(item.liquidity)}</strong></div><div><span>Активных / подходит</span><strong>${item.activeLots} / ${item.matchingLots}</strong></div></div>
+      <div class="risk-row">${item.risks.length ? item.risks.map((risk) => `<span><i data-lucide="shield-alert"></i>${escapeHtml(risk)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Явных рисков нет</span>`}</div>
+    </article>`;
+  }).join("") || `<div class="analytics-empty"><i data-lucide="sparkles"></i><strong>${analyticsInsights.length ? "Нет сигналов по выбранным фильтрам" : "Рассчитайте рыночные сигналы"}</strong><span>${rules.length ? "Расчёт использует активные правила" : "Сначала добавьте хотя бы одно правило"}</span></div>`;
+  createIcons({ icons: appIcons });
+}
+
+async function loadAnalytics() {
+  if (!rules.length) { toast("Для аналитики нужно хотя бы одно активное правило", true); return; }
+  $("#analytics-load").classList.add("busy");
+  $("#analytics-updated").textContent = `Анализирую рынки: ${rules.length}`;
+  try {
+    const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules });
+    analyticsInsights = response.insights;
+    $("#analytics-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+    renderAnalytics();
+    $(".workspace").scrollTop = 0;
+  } catch (error) { toast(String(error), true); log(String(error), true); $("#analytics-updated").textContent = "Не удалось рассчитать аналитику"; }
+  finally { $("#analytics-load").classList.remove("busy"); }
+}
+
 function renderRules() {
   $("#rule-count").textContent = String(rules.length);
   $("#stat-rules").textContent = String(rules.length);
@@ -689,6 +791,7 @@ $("#upsert").addEventListener("click", () => {
   try {
     const rule = currentRule();
     ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === rule.itemId && summary.region === rule.region));
+    analyticsInsights = [];
     if (editingIndex != null) rules[editingIndex] = rule;
     else { const duplicate = rules.findIndex((entry) => entry.itemId === rule.itemId && entry.region === rule.region); if (duplicate >= 0) rules[duplicate] = rule; else rules.push(rule); }
     editingIndex = undefined; setForm(); renderRules(); void persistRules(false); toast("Правило добавлено");
@@ -697,7 +800,7 @@ $("#upsert").addEventListener("click", () => {
 $("#rules-list").addEventListener("click", (event) => {
   const row = (event.target as HTMLElement).closest<HTMLElement>("[data-index]"); if (!row) return;
   const index = Number(row.dataset.index);
-  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === removed.itemId && summary.region === removed.region)); editingIndex = undefined; renderRules(); void persistRules(false); return; }
+  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === removed.itemId && summary.region === removed.region)); analyticsInsights = []; editingIndex = undefined; renderRules(); renderAnalytics(); void persistRules(false); return; }
   editingIndex = index; setForm(rules[index]); renderRules(); $(".rule-editor").scrollIntoView({ behavior: "smooth" });
 });
 $("#save").addEventListener("click", () => void persistRules());
@@ -715,8 +818,9 @@ $("#check-once").addEventListener("click", () => void runCheck(true));
 $("#overview-check").addEventListener("click", () => void runCheck(true));
 $(".workspace-tabs").addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-view]"); if (!button) return;
-  const view = button.dataset.view as "overview" | "config" | "history";
+  const view = button.dataset.view as "overview" | "config" | "history" | "analytics";
   if (view === "history" && selected && historyItem?.id !== selected.id) openHistory(selected); else switchView(view);
+  if (view === "analytics" && !analyticsInsights.length && rules.length) void loadAnalytics();
 });
 $("#market-rules").addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest("[data-open-config]")) { switchView("config"); return; }
@@ -743,6 +847,20 @@ $("#history-reset").addEventListener("click", () => {
   ["history-min-amount", "history-max-amount", "history-min-upgrade", "history-max-upgrade"].forEach((id) => input(id).value = "");
   document.querySelectorAll<HTMLInputElement>("#history-quality-options input").forEach((checkbox) => checkbox.checked = false);
   renderSalesHistory();
+});
+$("#analytics-load").addEventListener("click", () => void loadAnalytics());
+["analytics-region", "analytics-signal", "analytics-sort"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderAnalytics));
+$("#analytics-list").addEventListener("click", (event) => {
+  const card = (event.target as HTMLElement).closest<HTMLElement>("[data-insight-id]"); if (!card) return;
+  const itemId = card.dataset.insightId!; const region = card.dataset.insightRegion!;
+  if ((event.target as HTMLElement).closest(".insight-history")) {
+    const item = catalog.find((candidate) => candidate.id === itemId);
+    if (item) { $<HTMLSelectElement>("#region").value = region; openHistory(item); } else toast("Предмет не найден в загруженном каталоге", true);
+  }
+  if ((event.target as HTMLElement).closest(".insight-edit")) {
+    const index = rules.findIndex((rule) => rule.itemId === itemId && rule.region === region);
+    if (index >= 0) { editingIndex = index; setForm(rules[index]); renderRules(); switchView("config"); }
+  }
 });
 document.querySelectorAll<HTMLElement>("[data-close]").forEach((button) => button.addEventListener("click", () => $<HTMLDialogElement>(`#${button.dataset.close}`).close()));
 
