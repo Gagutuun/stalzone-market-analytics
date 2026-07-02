@@ -240,6 +240,11 @@ struct CacheSyncResponse {
 fn open_cache() -> Result<Connection, String> {
     let path = workspace_file(CACHE_FILE);
     let connection = Connection::open(&path).map_err(|error| format!("Не удалось открыть локальную базу: {error}"))?;
+    prepare_cache(&connection)?;
+    Ok(connection)
+}
+
+fn prepare_cache(connection: &Connection) -> Result<(), String> {
     connection.busy_timeout(std::time::Duration::from_secs(5)).map_err(|error| error.to_string())?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -273,10 +278,11 @@ fn open_cache() -> Result<Connection, String> {
          );
          CREATE INDEX IF NOT EXISTS snapshots_item_time ON market_snapshots(item_id, region, captured_timestamp DESC);"
     ).map_err(|error| format!("Не удалось подготовить локальную базу: {error}"))?;
-    Ok(connection)
+    Ok(())
 }
 
 fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usize, String> {
+    let region = region.to_ascii_uppercase();
     let mut connection = open_cache()?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
     let mut inserted = 0;
@@ -293,7 +299,7 @@ fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usiz
             let raw = serde_json::to_string(row).map_err(|error| error.to_string())?;
             let fingerprint = format!("{:x}", Sha256::digest(format!("{region}|{item_id}|{raw}").as_bytes()));
             inserted += statement.execute(params![
-                fingerprint, item_id, region, time, timestamp, amount(row), row_price,
+                fingerprint, item_id, &region, time, timestamp, amount(row), row_price,
                 lot_quality_code(row), lot_upgrade(row), raw
             ]).map_err(|error| error.to_string())?;
         }
@@ -303,6 +309,7 @@ fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usiz
 }
 
 fn load_cached_history(item_id: &str, region: &str, days: i64, limit: usize) -> Result<Vec<Value>, String> {
+    let region = region.to_ascii_uppercase();
     let connection = open_cache()?;
     let cutoff = chrono::Utc::now().timestamp() - days.max(1) * 86_400;
     let mut statement = connection.prepare(
@@ -314,7 +321,25 @@ fn load_cached_history(item_id: &str, region: &str, days: i64, limit: usize) -> 
     Ok(rows.filter_map(Result::ok).filter_map(|raw| serde_json::from_str(&raw).ok()).collect())
 }
 
+fn load_all_cached_history(item_id: &str, region: &str, limit: usize) -> Result<(u64, Vec<Value>), String> {
+    let region = region.to_ascii_uppercase();
+    let connection = open_cache()?;
+    let total = connection.query_row(
+        "SELECT COUNT(*) FROM sales WHERE item_id = ?1 AND region = ?2",
+        params![item_id, &region], |row| row.get::<_, u64>(0)
+    ).map_err(|error| error.to_string())?;
+    let mut statement = connection.prepare(
+        "SELECT raw_json FROM sales WHERE item_id = ?1 AND region = ?2
+         ORDER BY sold_timestamp DESC LIMIT ?3"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![item_id, &region, limit.clamp(5, 20_000) as i64], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let values = rows.filter_map(Result::ok).filter_map(|raw| serde_json::from_str(&raw).ok()).collect();
+    Ok((total, values))
+}
+
 fn cached_oldest_timestamp(item_id: &str, region: &str) -> Result<Option<i64>, String> {
+    let region = region.to_ascii_uppercase();
     let connection = open_cache()?;
     connection.query_row(
         "SELECT MIN(sold_timestamp) FROM sales WHERE item_id = ?1 AND region = ?2",
@@ -569,14 +594,24 @@ fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
 }
 
 fn save_market_snapshot(rule: &WatchRule, lots: &[Value], matching_lots: usize) -> Result<(), String> {
+    let connection = open_cache()?;
+    save_market_snapshot_to(&connection, rule, lots, matching_lots, chrono::Utc::now())
+}
+
+fn save_market_snapshot_to(
+    connection: &Connection,
+    rule: &WatchRule,
+    lots: &[Value],
+    matching_lots: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
     let comparable: Vec<&Value> = lots.iter().filter(|lot| variant_matches(rule, lot)).collect();
     let mut units: Vec<f64> = comparable.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
     units.sort_by(f64::total_cmp);
-    let now = chrono::Utc::now();
-    let connection = open_cache()?;
+    let region = rule.region.to_ascii_uppercase();
     let previous: Option<i64> = connection.query_row(
         "SELECT MAX(captured_timestamp) FROM market_snapshots WHERE item_id = ?1 AND region = ?2",
-        params![rule.item_id, rule.region], |row| row.get(0)
+        params![rule.item_id, &region], |row| row.get(0)
     ).unwrap_or(None);
     if previous.is_some_and(|timestamp| now.timestamp() - timestamp < 30) { return Ok(()); }
     connection.execute(
@@ -584,7 +619,7 @@ fn save_market_snapshot(rule: &WatchRule, lots: &[Value], matching_lots: usize) 
          (captured_at, captured_timestamp, item_id, region, active_lots, buyout_lots, matching_lots, total_amount, min_unit, second_min_unit, median_unit)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
-            now.to_rfc3339(), now.timestamp(), rule.item_id, rule.region,
+            now.to_rfc3339(), now.timestamp(), rule.item_id, &region,
             comparable.len() as i64, units.len() as i64, matching_lots as i64,
             comparable.iter().map(|lot| amount(lot)).sum::<i64>(),
             units.first().copied(), units.get(1).copied(), median(&units)
@@ -682,22 +717,7 @@ async fn analyze_market(rule: WatchRule) -> Result<MarketAnalysis, String> {
     })
 }
 
-#[tauri::command]
-async fn sales_history(item_id: String, region: String, limit: usize) -> Result<SalesHistoryResponse, String> {
-    let region = region.to_ascii_uppercase();
-    if !matches!(region.as_str(), "EU" | "RU" | "NA" | "SEA" | "NEA") { return Err("Неизвестный регион".into()); }
-    if item_id.trim().is_empty() { return Err("Не выбран предмет".into()); }
-    let url = format!("{API_BASE}/{region}/auction/{}/history?limit={}&additional=true",
-        urlencoding::encode(item_id.trim()), limit.clamp(5, 200));
-    let response = reqwest::Client::new().get(&url).headers(api_headers()?).send().await
-        .map_err(|error| format!("Ошибка сети: {error}"))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|error| error.to_string())?;
-    if !status.is_success() { return Err(format!("HTTP {}: {}", status.as_u16(), body)); }
-    let payload: Value = serde_json::from_str(&body).map_err(|error| format!("API вернул некорректный JSON: {error}"))?;
-    let total = payload.get("total").and_then(Value::as_u64).unwrap_or_default();
-    let raw_rows = payload.get("prices").and_then(Value::as_array).cloned().unwrap_or_default();
-    save_history_rows(item_id.trim(), &region, &raw_rows)?;
+fn history_response(total: u64, raw_rows: &[Value]) -> SalesHistoryResponse {
     let entries = raw_rows.iter().filter_map(|row| {
         let amount = amount(row);
         let price = price(row, "price")?;
@@ -710,7 +730,30 @@ async fn sales_history(item_id: String, region: String, limit: usize) -> Result<
             quality_code, upgrade: lot_upgrade(row),
         })
     }).collect();
-    Ok(SalesHistoryResponse { total, entries })
+    SalesHistoryResponse { total, entries }
+}
+
+#[tauri::command]
+async fn sales_history(item_id: String, region: String, limit: usize, source: String) -> Result<SalesHistoryResponse, String> {
+    let region = region.to_ascii_uppercase();
+    if !matches!(region.as_str(), "EU" | "RU" | "NA" | "SEA" | "NEA") { return Err("Неизвестный регион".into()); }
+    if item_id.trim().is_empty() { return Err("Не выбран предмет".into()); }
+    if source == "local" {
+        let (total, raw_rows) = load_all_cached_history(item_id.trim(), &region, limit)?;
+        return Ok(history_response(total, &raw_rows));
+    }
+    let url = format!("{API_BASE}/{region}/auction/{}/history?limit={}&additional=true",
+        urlencoding::encode(item_id.trim()), limit.clamp(5, 200));
+    let response = reqwest::Client::new().get(&url).headers(api_headers()?).send().await
+        .map_err(|error| format!("Ошибка сети: {error}"))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() { return Err(format!("HTTP {}: {}", status.as_u16(), body)); }
+    let payload: Value = serde_json::from_str(&body).map_err(|error| format!("API вернул некорректный JSON: {error}"))?;
+    let total = payload.get("total").and_then(Value::as_u64).unwrap_or_default();
+    let raw_rows = payload.get("prices").and_then(Value::as_array).cloned().unwrap_or_default();
+    save_history_rows(item_id.trim(), &region, &raw_rows)?;
+    Ok(history_response(total, &raw_rows))
 }
 
 #[tauri::command]
@@ -951,5 +994,31 @@ mod tests {
     fn zero_buyout_is_not_a_market_price() {
         let lot = json!({"amount": 1, "buyoutPrice": 0});
         assert_eq!(unit_price(&lot, "buyoutPrice"), None);
+    }
+
+    #[test]
+    fn market_snapshots_are_isolated_by_region() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let lots = vec![json!({"amount": 2, "buyoutPrice": 200})];
+        let now = chrono::Utc::now();
+        let mut ru_rule = rule_with_quality("special");
+        ru_rule.artifact_qualities.clear();
+        let mut eu_rule = ru_rule.clone();
+        eu_rule.region = "eu".into();
+
+        save_market_snapshot_to(&connection, &ru_rule, &lots, 1, now).expect("RU snapshot");
+        save_market_snapshot_to(&connection, &eu_rule, &lots, 1, now).expect("EU snapshot");
+        save_market_snapshot_to(&connection, &ru_rule, &lots, 1, now).expect("throttled RU snapshot");
+
+        let ru_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM market_snapshots WHERE item_id = ?1 AND region = 'RU'",
+            params![ru_rule.item_id], |row| row.get(0)
+        ).expect("RU count");
+        let eu_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM market_snapshots WHERE item_id = ?1 AND region = 'EU'",
+            params![ru_rule.item_id], |row| row.get(0)
+        ).expect("EU count");
+        assert_eq!((ru_count, eu_count), (1, 1));
     }
 }

@@ -42,10 +42,14 @@ for a standalone build. It is local-only and excluded from Git.
   region; later runs continue incrementally and can extend the archive.
 - Every sale has a stable SHA-256 fingerprint, so requesting the same API pages
   again does not create duplicate rows.
+- Sales and market snapshots are always stored and queried by the composite
+  market key `item_id + region`; region names are normalized to uppercase.
 - Current market supply is stored as timestamped snapshots at most once every
   30 seconds per item and region.
 - Analytics currently reads up to 20,000 cached sales from the last 30 days for
   each rule. The raw API response is retained in SQLite for future metrics.
+- The sales history filters include an `API / Local` source switch. Local mode
+  can plot or tabulate up to 5,000 cached sales for the selected item and region.
 
 The Tauri interface reads and writes the existing `auction_watchlist.json` and
 `.auction_seen.json`, so rules and notification deduplication remain compatible

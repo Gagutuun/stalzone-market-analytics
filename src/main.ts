@@ -200,8 +200,9 @@ app.innerHTML = `
           <button id="history-load" class="primary"><i data-lucide="refresh-cw"></i> Загрузить</button>
         </section>
         <section class="history-filters">
+          <div class="history-mode history-source"><span>Источник</span><div class="segmented" id="history-source"><button class="active" data-value="api" title="Свежие продажи напрямую из API">API</button><button data-value="local" title="Продажи, накопленные приложением для выбранного региона">Локально</button></div></div>
           <label><span>Регион</span><select id="history-region"><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
-          <label><span>Последних продаж</span><select id="history-limit"><option>50</option><option selected>100</option><option>200</option></select></label>
+          <label><span>Последних продаж</span><select id="history-limit"><option>50</option><option selected>100</option><option>200</option><option data-local-only value="500">500</option><option data-local-only value="1000">1 000</option><option data-local-only value="5000">5 000</option></select></label>
           <label><span>Количество в лоте, от</span><input id="history-min-amount" type="number" min="1" placeholder="Любое" /></label>
           <label><span>до</span><input id="history-max-amount" type="number" min="1" placeholder="Любое" /></label>
           <div class="history-mode"><span>Цена</span><div class="segmented" id="history-price-mode"><button class="active" data-value="total">За лот</button><button data-value="unit">За штуку</button></div></div>
@@ -289,6 +290,7 @@ let nextCheckAt: number | undefined;
 let historyItem: CatalogItem | undefined;
 let historyEntries: SalesHistoryEntry[] = [];
 let historyTotal = 0;
+let historySource: "api" | "local" = "api";
 let historyPriceMode: "total" | "unit" = "total";
 let historyDisplayMode: "chart" | "table" = "chart";
 let historyChart: IChartApi | undefined;
@@ -569,6 +571,17 @@ function renderSalesHistory() {
   renderHistoryChart(entries);
 }
 
+function updateHistorySourceControls() {
+  const limit = $<HTMLSelectElement>("#history-limit");
+  limit.querySelectorAll<HTMLOptionElement>("[data-local-only]").forEach((option) => {
+    option.disabled = historySource === "api";
+    option.hidden = historySource === "api";
+  });
+  if (historySource === "api" && Number(limit.value) > 200) limit.value = "200";
+  $("#history-source").querySelectorAll("button").forEach((button) =>
+    button.classList.toggle("active", (button as HTMLButtonElement).dataset.value === historySource));
+}
+
 async function loadSalesHistory() {
   if (!historyItem) { toast("Сначала выберите предмет в каталоге", true); return; }
   $("#history-load").classList.add("busy");
@@ -577,9 +590,12 @@ async function loadSalesHistory() {
       itemId: historyItem.id,
       region: $<HTMLSelectElement>("#history-region").value,
       limit: Number($<HTMLSelectElement>("#history-limit").value),
+      source: historySource,
     });
     historyEntries = response.entries; historyTotal = response.total;
-    $("#history-subtitle").textContent = `${response.total.toLocaleString("ru-RU")} продаж в API · загружено ${response.entries.length}`;
+    const region = $<HTMLSelectElement>("#history-region").value;
+    const sourceLabel = historySource === "local" ? "в локальном архиве" : "в API";
+    $("#history-subtitle").textContent = `${region} · ${response.total.toLocaleString("ru-RU")} продаж ${sourceLabel} · показано ${response.entries.length}`;
     renderSalesHistory();
     await refreshCacheStatus();
   } catch (error) { toast(String(error), true); log(String(error), true); }
@@ -855,6 +871,16 @@ $("#market-rules").addEventListener("click", (event) => {
 $("#clear-matches").addEventListener("click", () => { matches = []; renderMatches(); });
 $("#matches").addEventListener("click", (event) => { const row = (event.target as HTMLElement).closest<HTMLElement>("[data-match]"); if (!row) return; $("#details-content").textContent = matches[Number(row.dataset.match)].message; $<HTMLDialogElement>("#details-dialog").showModal(); });
 $("#history-load").addEventListener("click", () => void loadSalesHistory());
+$("#history-source").addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button");
+  if (!button || button.dataset.value === historySource) return;
+  historySource = button.dataset.value as "api" | "local";
+  updateHistorySourceControls();
+  if (historyItem) void loadSalesHistory();
+});
+["history-region", "history-limit"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", () => {
+  if (historyItem) void loadSalesHistory();
+}));
 $("#history-price-mode").addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button"); if (!button) return;
   historyPriceMode = button.dataset.value as "total" | "unit";
@@ -872,6 +898,7 @@ $("#history-reset").addEventListener("click", () => {
   document.querySelectorAll<HTMLInputElement>("#history-quality-options input").forEach((checkbox) => checkbox.checked = false);
   renderSalesHistory();
 });
+updateHistorySourceControls();
 $("#analytics-load").addEventListener("click", () => void loadAnalytics());
 ["analytics-region", "analytics-signal", "analytics-sort"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderAnalytics));
 $("#analytics-list").addEventListener("click", (event) => {
