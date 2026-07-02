@@ -31,6 +31,12 @@ opportunities using discount to the sales median, sales velocity, price spread,
 and sample size. Each signal includes P25/median/P75 price zones, trend,
 liquidity, active supply, matching lots, and explicit risk indicators.
 
+The market movement tab reads only the local collector database. For 24-hour,
+7-day, and 30-day periods it shows supply and median-price charts, appeared and
+disappeared lots, average observed lifetime, collection coverage, market-state
+signals, and a recent lifecycle event log. A disappeared lot is not presented as
+a confirmed sale because the public auction response does not expose that fact.
+
 ## Local market archive
 
 Sales used by analytics are stored in `market_cache.sqlite3`. The file is kept
@@ -105,6 +111,12 @@ python .\auction_watcher.py --once --notify-existing
 
 - `name`: human-friendly label for notifications.
 - `itemId`: STALZONE item id, for example `y1q9`.
+- `scope`: `item` for one item or `category` for a catalog-wide rule.
+- `category` / `itemIds`: catalog category and only the concrete items explicitly
+  selected in the searchable category picker. A category is never selected in
+  full automatically.
+- `topN`: number of best category offers to return. Offers are ranked by unit
+  price divided by the matching item's own sales median.
 - `region`: `RU`, `EU`, `NA`, `SEA`, or `NEA`.
 - `maxBuyout`: maximum total buyout price.
 - `maxUnitBuyout`: maximum buyout price per item in a stack.
@@ -123,3 +135,7 @@ python .\auction_watcher.py --once --notify-existing
 
 Notifications always print to the application log. Telegram and Discord are
 enabled when their optional environment variables are set.
+
+Category rules use one auction endpoint per concrete item. To avoid excessive
+API traffic, starting monitoring with at least one category rule enforces a
+minimum interval of five minutes.

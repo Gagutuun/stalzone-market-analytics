@@ -56,6 +56,10 @@ pub struct WatchRule {
     pub limit: usize,
     #[serde(default = "default_true")]
     pub additional: bool,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub group_top_n: Option<usize>,
 }
 
 fn default_history_limit() -> usize { 100 }
@@ -148,6 +152,57 @@ struct MarketAnalyticsResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MovementPoint {
+    time: i64,
+    supply: i64,
+    min_unit: Option<f64>,
+    median_unit: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MovementEvent {
+    kind: String,
+    time: String,
+    amount: i64,
+    buyout: Option<i64>,
+    unit_price: Option<f64>,
+    lifetime_minutes: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketMovement {
+    item_id: String,
+    region: String,
+    current_supply: i64,
+    supply_change_percent: Option<f64>,
+    current_min_unit: Option<f64>,
+    current_median_unit: Option<f64>,
+    price_change_percent: Option<f64>,
+    appeared: u64,
+    disappeared: u64,
+    ended: u64,
+    active_lots: u64,
+    average_lifetime_minutes: Option<f64>,
+    collections: u64,
+    coverage_percent: f64,
+    last_collected: String,
+    signal: String,
+    points: Vec<MovementPoint>,
+    events: Vec<MovementEvent>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketMovementResponse {
+    generated_at: String,
+    hours: i64,
+    markets: Vec<MarketMovement>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MatchRecord {
     name: String,
     region: String,
@@ -160,6 +215,15 @@ struct MatchRecord {
     current: Option<i64>,
     end: String,
     message: String,
+    deal_ratio: Option<f64>,
+    #[serde(skip)]
+    group_id: Option<String>,
+    #[serde(skip)]
+    group_top_n: Option<usize>,
+    #[serde(skip)]
+    seen_key: String,
+    #[serde(skip)]
+    is_new: bool,
 }
 
 #[derive(Serialize)]
@@ -848,6 +912,175 @@ async fn sales_history(item_id: String, region: String, limit: usize, source: St
     Ok(history_response(total, &raw_rows))
 }
 
+fn collection_unit_prices(connection: &Connection, collection_id: i64) -> Result<Vec<f64>, String> {
+    let mut statement = connection.prepare(
+        "SELECT CAST(buyout_price AS REAL) / amount FROM lot_observations
+         WHERE collection_id = ?1 AND buyout_price > 0 AND amount > 0"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![collection_id], |row| row.get::<_, f64>(0))
+        .map_err(|error| error.to_string())?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+#[tauri::command]
+fn market_movement(hours: i64, region: String) -> Result<MarketMovementResponse, String> {
+    let connection = open_cache()?;
+    market_movement_from(&connection, hours, region, chrono::Utc::now())
+}
+
+fn market_movement_from(
+    connection: &Connection,
+    hours: i64,
+    region: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<MarketMovementResponse, String> {
+    let hours = match hours { 24 | 168 | 720 => hours, _ => 24 };
+    let cutoff = now.timestamp() - hours * 3_600;
+    let region_filter = region.to_ascii_uppercase();
+    let markets: Vec<(String, String)> = {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT item_id, region FROM market_collections
+             WHERE (?1 = 'ALL' OR region = ?1) ORDER BY region, item_id"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map(params![&region_filter], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let mut movements = Vec::new();
+    for (item_id, market_region) in markets {
+        let collection_stats: (u64, u64) = connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(complete), 0) FROM market_collections
+             WHERE item_id = ?1 AND region = ?2 AND collected_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| Ok((row.get(0)?, row.get(1)?))
+        ).map_err(|error| error.to_string())?;
+        if collection_stats.0 == 0 { continue; }
+        let sampled_collections: Vec<(i64, String, i64, i64)> = {
+            let mut statement = connection.prepare(
+                "WITH base AS (
+                   SELECT id, collected_at, collected_timestamp, api_total
+                   FROM market_collections
+                   WHERE item_id = ?1 AND region = ?2 AND collected_timestamp >= ?3
+                 ), numbered AS (
+                   SELECT *, ROW_NUMBER() OVER (ORDER BY collected_timestamp) AS rn, COUNT(*) OVER () AS total_count
+                   FROM base
+                 )
+                 SELECT id, collected_at, collected_timestamp, api_total FROM numbered
+                 WHERE total_count <= 240
+                    OR (rn - 1) % ((total_count + 239) / 240) = 0
+                    OR rn = total_count
+                 ORDER BY collected_timestamp"
+            ).map_err(|error| error.to_string())?;
+            let rows = statement.query_map(params![&item_id, &market_region, cutoff], |row|
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                .map_err(|error| error.to_string())?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let mut points = Vec::new();
+        let mut last_collected = String::new();
+        for (collection_id, collected_at, timestamp, supply) in sampled_collections {
+            let prices = collection_unit_prices(connection, collection_id)?;
+            last_collected = collected_at;
+            points.push(MovementPoint {
+                time: timestamp,
+                supply,
+                min_unit: prices.iter().copied().min_by(f64::total_cmp),
+                median_unit: median(&prices),
+            });
+        }
+        let appeared = connection.query_row(
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND first_seen_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
+        let disappeared = connection.query_row(
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND missing_since_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
+        let ended = connection.query_row(
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'ended' AND end_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
+        let active_lots = connection.query_row(
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'active'",
+            params![&item_id, &market_region], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
+        let average_lifetime_minutes = connection.query_row(
+            "SELECT AVG(CASE
+               WHEN status = 'missing' THEN missing_since_timestamp - first_seen_timestamp
+               WHEN status = 'ended' THEN end_timestamp - first_seen_timestamp END) / 60.0
+             FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status IN ('missing', 'ended')
+               AND COALESCE(missing_since_timestamp, end_timestamp) >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, Option<f64>>(0)
+        ).unwrap_or(None);
+        let mut events = Vec::new();
+        {
+            let mut statement = connection.prepare(
+                "SELECT first_seen_at, first_seen_timestamp, missing_since_at, missing_since_timestamp,
+                        status, end_time, end_timestamp, amount, buyout_price
+                 FROM tracked_lots WHERE item_id = ?1 AND region = ?2
+                   AND (first_seen_timestamp >= ?3 OR missing_since_timestamp >= ?3
+                        OR (status = 'ended' AND end_timestamp >= ?3))
+                 ORDER BY MAX(first_seen_timestamp, COALESCE(missing_since_timestamp, 0), COALESCE(end_timestamp, 0)) DESC
+                 LIMIT 100"
+            ).map_err(|error| error.to_string())?;
+            type EventRow = (String, i64, Option<String>, Option<i64>, String, Option<String>, Option<i64>, i64, Option<i64>);
+            let rows = statement.query_map(params![&item_id, &market_region, cutoff], |row| Ok(EventRow::from((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?
+            )))).map_err(|error| error.to_string())?;
+            for row in rows.filter_map(Result::ok) {
+                let (first_at, first_ts, missing_at, missing_ts, status, end_at, end_ts, amount, buyout) = row;
+                let unit_price = buyout.filter(|price| *price > 0).filter(|_| amount > 0).map(|price| price as f64 / amount as f64);
+                if first_ts >= cutoff {
+                    events.push(MovementEvent { kind: "appeared".into(), time: first_at, amount, buyout, unit_price, lifetime_minutes: None });
+                }
+                if status == "missing" {
+                    if let (Some(time), Some(timestamp)) = (missing_at, missing_ts) {
+                        events.push(MovementEvent { kind: "missing".into(), time, amount, buyout, unit_price,
+                            lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0) });
+                    }
+                } else if status == "ended" {
+                    if let (Some(time), Some(timestamp)) = (end_at, end_ts) {
+                        events.push(MovementEvent { kind: "ended".into(), time, amount, buyout, unit_price,
+                            lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0) });
+                    }
+                }
+            }
+        }
+        events.sort_by(|a, b| b.time.cmp(&a.time));
+        events.truncate(50);
+        let first = points.first();
+        let last = points.last();
+        let supply_change_percent = first.zip(last).and_then(|(start, current)|
+            (start.supply > 0).then_some((current.supply - start.supply) as f64 / start.supply as f64 * 100.0));
+        let price_change_percent = first.and_then(|point| point.median_unit).zip(last.and_then(|point| point.median_unit))
+            .and_then(|(start, current)| (start > 0.0).then_some((current - start) / start * 100.0));
+        let signal = if points.len() < 2 {
+            "Нужно больше данных"
+        } else if supply_change_percent.is_some_and(|value| value <= -10.0) && price_change_percent.is_some_and(|value| value >= 5.0) {
+            "Дефицит усиливается"
+        } else if supply_change_percent.is_some_and(|value| value >= 15.0) && price_change_percent.is_some_and(|value| value <= -5.0) {
+            "Перенасыщение"
+        } else if disappeared > appeared && price_change_percent.is_some_and(|value| value > 0.0) {
+            "Лоты исчезают быстрее"
+        } else {
+            "Рынок стабилен"
+        }.to_string();
+        movements.push(MarketMovement {
+            item_id, region: market_region,
+            current_supply: last.map(|point| point.supply).unwrap_or_default(),
+            supply_change_percent,
+            current_min_unit: last.and_then(|point| point.min_unit),
+            current_median_unit: last.and_then(|point| point.median_unit),
+            price_change_percent, appeared, disappeared, ended, active_lots,
+            average_lifetime_minutes, collections: collection_stats.0,
+            coverage_percent: collection_stats.1 as f64 / collection_stats.0 as f64 * 100.0,
+            last_collected, signal, points, events,
+        });
+    }
+    movements.sort_by(|a, b| b.disappeared.cmp(&a.disappeared).then_with(|| b.appeared.cmp(&a.appeared)));
+    Ok(MarketMovementResponse { generated_at: now.to_rfc3339(), hours, markets: movements })
+}
+
 #[tauri::command]
 async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsResponse, String> {
     let mut insights = Vec::new();
@@ -1130,7 +1363,7 @@ async fn check_rules(
         }
         let (api_total, lots, _) = collected_markets.get(&market_key).expect("market was collected");
         let current: Vec<f64> = lots.iter().filter(|lot| variant_matches(rule, lot)).filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
-        let history_median = if rule.max_history_median_ratio.is_some() {
+        let history_median = if rule.max_history_median_ratio.is_some() || rule.group_id.is_some() {
             let history = request_collection(rule, true).await?;
             let values: Vec<f64> = history.iter().filter(|lot| variant_matches(rule, lot)).filter_map(|lot| unit_price(lot, "price")).collect();
             median(&values)
@@ -1149,19 +1382,44 @@ async fn check_rules(
         for lot in lots {
             let key = lot_key(rule, lot);
             let already_seen = seen.contains(&key);
-            if already_seen && !include_seen { continue; }
-            if !already_seen { updated.insert(key); }
+            if already_seen && !include_seen && rule.group_id.is_none() { continue; }
+            if !already_seen && rule.group_id.is_none() { updated.insert(key.clone()); }
             if (notify_existing || include_seen) && lot_matches(rule, lot, &current, history_median) {
                 let message = format_lot(rule, lot);
-                if !already_seen { send_external_notifications(&message).await; }
+                let unit = unit_price(lot, "buyoutPrice");
                 matches.push(MatchRecord {
                     name: rule.name.clone(), region: rule.region.clone(), item_id: rule.item_id.clone(),
                     quality: lot_quality_code(lot).and_then(quality_label).map(str::to_string),
                     upgrade: lot_upgrade(lot), amount: amount(lot),
-                    buyout: price(lot, "buyoutPrice").filter(|value| *value > 0), unit: unit_price(lot, "buyoutPrice"),
+                    buyout: price(lot, "buyoutPrice").filter(|value| *value > 0), unit,
                     current: price(lot, "currentPrice"), end: lot.get("endTime").and_then(Value::as_str).unwrap_or_default().into(), message,
+                    deal_ratio: unit.zip(history_median).and_then(|(price, market)| (market > 0.0).then_some(price / market)),
+                    group_id: rule.group_id.clone(), group_top_n: rule.group_top_n,
+                    seen_key: key, is_new: !already_seen,
                 });
             }
+        }
+    }
+    let mut individual = Vec::new();
+    let mut groups: HashMap<String, Vec<MatchRecord>> = HashMap::new();
+    for record in matches {
+        if let Some(group_id) = &record.group_id {
+            groups.entry(group_id.clone()).or_default().push(record);
+        } else {
+            individual.push(record);
+        }
+    }
+    for mut records in groups.into_values() {
+        records.sort_by(|a, b| a.deal_ratio.unwrap_or(f64::INFINITY).total_cmp(&b.deal_ratio.unwrap_or(f64::INFINITY))
+            .then_with(|| a.unit.unwrap_or(f64::INFINITY).total_cmp(&b.unit.unwrap_or(f64::INFINITY))));
+        let top_n = records.first().and_then(|record| record.group_top_n).unwrap_or(1).clamp(1, 20);
+        individual.extend(records.into_iter().take(top_n));
+    }
+    let matches: Vec<MatchRecord> = if include_seen { individual } else { individual.into_iter().filter(|record| record.is_new).collect() };
+    for record in &matches {
+        if record.is_new {
+            updated.insert(record.seen_key.clone());
+            send_external_notifications(&record.message).await;
         }
     }
     let mut seen_values: Vec<String> = updated.into_iter().collect();
@@ -1197,7 +1455,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { check_lock: tokio::sync::Mutex::new(()) })
-        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, market_analytics, check_rules, load_rules, save_rules])
+        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, market_movement, market_analytics, check_rules, load_rules, save_rules])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }
@@ -1253,6 +1511,51 @@ mod tests {
         let keys = tracked_lot_keys(&rule, &[lot.clone(), lot]);
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn movement_analytics_uses_supply_prices_and_lifecycle_events() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (timestamp, supply) in [(now.timestamp() - 3_600, 10), (now.timestamp(), 8)] {
+            connection.execute(
+                "INSERT INTO market_collections
+                 (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+                 VALUES (?1, ?2, 'item', 'RU', ?3, ?3, 1)",
+                params![chrono::DateTime::from_timestamp(timestamp, 0).unwrap().to_rfc3339(), timestamp, supply]
+            ).unwrap();
+            let collection_id = connection.last_insert_rowid();
+            let prices = if supply == 10 { [80, 120] } else { [100, 200] };
+            for (index, price) in prices.into_iter().enumerate() {
+                connection.execute(
+                    "INSERT INTO lot_observations
+                     (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                     VALUES (?1, ?2, 'item', 'RU', 1, ?3, '{}')",
+                    params![collection_id, format!("{collection_id}-{index}"), price]
+                ).unwrap();
+            }
+        }
+        connection.execute(
+            "INSERT INTO tracked_lots
+             (lot_key, item_id, region, first_seen_at, first_seen_timestamp, last_seen_at, last_seen_timestamp,
+              missing_since_at, missing_since_timestamp, status, observation_count, amount, buyout_price, raw_json)
+             VALUES ('gone', 'item', 'RU', ?1, ?2, ?1, ?2, ?3, ?4, 'missing', 2, 1, 100, '{}')",
+            params![(now - chrono::Duration::minutes(30)).to_rfc3339(), now.timestamp() - 1_800,
+                (now - chrono::Duration::minutes(5)).to_rfc3339(), now.timestamp() - 300]
+        ).unwrap();
+
+        let response = market_movement_from(&connection, 24, "all".into(), now).expect("movement response");
+        assert_eq!(response.markets.len(), 1);
+        let market = &response.markets[0];
+        assert_eq!(market.current_supply, 8);
+        assert_eq!(market.current_median_unit, Some(150.0));
+        assert_eq!(market.supply_change_percent, Some(-20.0));
+        assert_eq!(market.price_change_percent, Some(50.0));
+        assert_eq!(market.disappeared, 1);
+        assert_eq!(market.coverage_percent, 100.0);
+        assert_eq!(market.signal, "Дефицит усиливается");
+        assert!(market.events.iter().any(|event| event.kind == "missing"));
     }
 
     #[test]

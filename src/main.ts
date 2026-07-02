@@ -3,13 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { ColorType, createChart, LineSeries, type IChartApi, type UTCTimestamp } from "lightweight-charts";
 import {
-  BarChart3, Bell, ChartNoAxesCombined, Check, ChevronRight, Coins, createIcons,
+  Activity, BarChart3, Bell, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, createIcons,
   ChartLine, CircleDollarSign, Database, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
   RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, X,
 } from "lucide";
 
 const appIcons = {
-  BarChart3, Bell, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Coins, Database,
+  Activity, BarChart3, Bell, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, Database,
   CircleDollarSign, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
   RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, X,
 };
@@ -28,6 +28,10 @@ type Rule = {
   name: string;
   itemId: string;
   region: string;
+  scope?: "item" | "category";
+  category?: string;
+  itemIds?: string[];
+  topN?: number;
   maxBuyout?: number;
   maxUnitBuyout?: number;
   maxHistoryMedianRatio?: number;
@@ -43,6 +47,8 @@ type Rule = {
   order?: string;
   limit?: number;
   additional?: boolean;
+  groupId?: string;
+  groupTopN?: number;
 };
 
 type MatchRecord = {
@@ -55,6 +61,7 @@ type MatchRecord = {
   buyout?: number;
   unit?: number;
   current?: number;
+  dealRatio?: number;
   end: string;
   message: string;
 };
@@ -85,6 +92,16 @@ type MarketInsight = {
   verdict: string; risks: string[];
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
+type MovementPoint = { time: number; supply: number; minUnit?: number; medianUnit?: number };
+type MovementEvent = { kind: "appeared" | "missing" | "ended"; time: string; amount: number; buyout?: number; unitPrice?: number; lifetimeMinutes?: number };
+type MarketMovement = {
+  itemId: string; region: string; currentSupply: number; supplyChangePercent?: number;
+  currentMinUnit?: number; currentMedianUnit?: number; priceChangePercent?: number;
+  appeared: number; disappeared: number; ended: number; activeLots: number;
+  averageLifetimeMinutes?: number; collections: number; coveragePercent: number;
+  lastCollected: string; signal: string; points: MovementPoint[]; events: MovementEvent[];
+};
+type MarketMovementResponse = { generatedAt: string; hours: number; markets: MarketMovement[] };
 type CacheStatus = {
   sales: number; snapshots: number; items: number; collections: number; lotObservations: number;
   trackedLots: number; activeLots: number; trackedMarkets: number; lastCollection?: string;
@@ -137,6 +154,7 @@ app.innerHTML = `
         <button data-view="config"><i data-lucide="sliders-horizontal"></i> Правила и фильтры</button>
         <button data-view="history"><i data-lucide="history"></i> История продаж</button>
         <button data-view="analytics"><i data-lucide="sparkles"></i> Аналитика</button>
+        <button data-view="movement"><i data-lucide="activity"></i> Движение рынка</button>
       </nav>
 
       <div id="overview-view" class="workspace-view">
@@ -162,7 +180,17 @@ app.innerHTML = `
         <div class="section-heading"><div><span class="eyebrow">Условия поиска</span><h2>Правило отслеживания</h2></div><button id="clear-form" class="text-button"><i data-lucide="rotate-ccw"></i> Очистить</button></div>
         <div class="identity-grid">
           <label><span>Название</span><input id="rule-name" placeholder="Например, Атом выгодно" /></label>
-          <label><span>Item ID</span><input id="item-id" placeholder="Выберите предмет слева" /></label>
+          <div class="scope-picker"><span>Область поиска</span><div class="segmented" id="rule-scope"><button class="active" data-value="item">Предмет</button><button data-value="category">Категория</button></div></div>
+        </div>
+        <div id="item-scope" class="scope-fields"><label><span>Item ID</span><input id="item-id" placeholder="Выберите предмет слева" /></label></div>
+        <div id="category-scope" class="scope-fields category-scope hidden">
+          <label><span>Категория</span><select id="rule-category"><option value="">Выберите категорию</option></select></label>
+          <label><span>Лучших предложений</span><select id="category-top"><option value="1">Одно лучшее</option><option value="3">Три лучших</option><option value="5">Пять лучших</option></select></label>
+          <div class="category-count"><i data-lucide="database"></i><div><strong id="category-item-count">0 предметов</strong><span>Каждый предмет проверяется отдельно; рейтинг строится по скидке к его медиане</span></div></div>
+          <div class="category-selector">
+            <div class="category-selector-head"><label class="category-search"><i data-lucide="search"></i><input id="category-item-search" placeholder="Найти предмет по названию или ID" /></label><button id="category-select-visible" class="secondary" type="button">Выбрать найденные</button><button id="category-clear-items" class="icon-button" type="button" title="Очистить выбор"><i data-lucide="x"></i></button></div>
+            <div id="category-item-list" class="category-item-list"><div class="category-item-empty">Выберите категорию</div></div>
+          </div>
         </div>
 
         <div class="filter-section">
@@ -257,6 +285,32 @@ app.innerHTML = `
         </section>
         <section id="analytics-list" class="analytics-list"><div class="analytics-empty"><i data-lucide="sparkles"></i><strong>Рассчитайте рыночные сигналы</strong><span>Нужны активные правила и доступ к API</span></div></section>
       </div>
+
+      <div id="movement-view" class="workspace-view hidden">
+        <section class="movement-head">
+          <div><span class="eyebrow">Локальные наблюдения</span><h2>Движение рынка</h2><small id="movement-updated">Используются данные фонового сборщика</small></div>
+          <button id="movement-load" class="primary"><i data-lucide="refresh-cw"></i> Обновить</button>
+        </section>
+        <section class="movement-toolbar">
+          <label><span>Период</span><select id="movement-hours"><option value="24">24 часа</option><option value="168">7 дней</option><option value="720">30 дней</option></select></label>
+          <label><span>Регион</span><select id="movement-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
+          <label class="movement-search"><span>Поиск</span><div><i data-lucide="search"></i><input id="movement-search" placeholder="Название или Item ID" /></div></label>
+          <div class="movement-note"><i data-lucide="shield-check"></i><span>Исчезновение фиксируется только при полном обходе рынка</span></div>
+        </section>
+        <section class="movement-stats">
+          <div><span>Рынков</span><strong id="movement-markets">—</strong></div>
+          <div><span>Активное предложение</span><strong id="movement-supply">—</strong></div>
+          <div><span>Появилось</span><strong id="movement-appeared">—</strong></div>
+          <div><span>Исчезло</span><strong id="movement-disappeared">—</strong></div>
+          <div><span>Покрытие</span><strong id="movement-coverage">—</strong></div>
+        </section>
+        <section class="movement-layout">
+          <div id="movement-list" class="movement-list"><div class="movement-empty">Сначала запустите мониторинг</div></div>
+          <div id="movement-detail" class="movement-detail">
+            <div class="movement-empty"><i data-lucide="activity"></i><strong>Пока нет наблюдений</strong><span>Сборщик начнёт строить движение после нескольких проходов</span></div>
+          </div>
+        </section>
+      </div>
     </main>
 
     <aside class="monitor-panel">
@@ -287,6 +341,8 @@ const escapeHtml = (text: string) => text.replace(/[&<>'"]/g, (char) => ({ "&": 
 let catalog: CatalogItem[] = [];
 let selected: CatalogItem | undefined;
 let rules: Rule[] = [];
+let ruleScope: "item" | "category" = "item";
+let categorySelectedIds = new Set<string>();
 let matches: MatchRecord[] = [];
 let category = "";
 let realm = "global";
@@ -304,6 +360,10 @@ let historyDisplayMode: "chart" | "table" = "chart";
 let historyChart: IChartApi | undefined;
 let historyResizeObserver: ResizeObserver | undefined;
 let analyticsInsights: MarketInsight[] = [];
+let movementMarkets: MarketMovement[] = [];
+let selectedMovementKey: string | undefined;
+let movementChart: IChartApi | undefined;
+let movementResizeObserver: ResizeObserver | undefined;
 
 function toast(message: string, danger = false) {
   const element = $("#toast");
@@ -327,6 +387,7 @@ async function loadCatalog() {
     const categories = [...new Set(catalog.map((item) => item.category).filter(Boolean))].sort();
     $("#category-tabs").innerHTML = `<button class="active" data-category="">Все</button>${categories.map((name) => `<button data-category="${escapeHtml(name)}">${escapeHtml(name)}</button>`).join("")}`;
     category = "";
+    updateRuleCategoryOptions();
     renderCatalog();
     log(`Каталог EXBO загружен через API: ${catalog.length} предметов`);
   } catch (error) {
@@ -365,17 +426,83 @@ async function selectItem(item: CatalogItem) {
   }
 }
 
+function categoryItems(categoryName = $<HTMLSelectElement>("#rule-category").value) {
+  return catalog.filter((item) => item.category === categoryName);
+}
+
+function visibleCategoryItems() {
+  const query = value("category-item-search").toLocaleLowerCase("ru");
+  return categoryItems().filter((item) =>
+    `${item.id} ${item.nameRu} ${item.nameEn} ${item.subcategory}`.toLocaleLowerCase("ru").includes(query));
+}
+
+function renderCategoryItemSelector() {
+  const items = visibleCategoryItems();
+  $("#category-item-list").innerHTML = items.map((item) => `
+    <label class="category-item-option"><input type="checkbox" value="${escapeHtml(item.id)}"${categorySelectedIds.has(item.id) ? " checked" : ""} /><span><strong>${escapeHtml(item.nameRu || item.nameEn || item.id)}</strong><small>${escapeHtml(item.id)} · ${escapeHtml(item.subcategory || item.category)}</small></span></label>`).join("")
+    || `<div class="category-item-empty">${$<HTMLSelectElement>("#rule-category").value ? "Ничего не найдено" : "Выберите категорию"}</div>`;
+  updateCategoryCount();
+}
+
+function updateRuleCategoryOptions(preferred?: string) {
+  const select = $<HTMLSelectElement>("#rule-category");
+  const current = preferred ?? select.value;
+  const categories = [...new Set(catalog.map((item) => item.category).filter(Boolean))].sort();
+  select.innerHTML = `<option value="">Выберите категорию</option>${categories.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
+  if (categories.includes(current)) select.value = current;
+  renderCategoryItemSelector();
+}
+
+function updateCategoryCount() {
+  const total = categoryItems().length;
+  const selectedCount = categorySelectedIds.size;
+  $("#category-item-count").textContent = `${selectedCount.toLocaleString("ru-RU")} выбрано из ${total.toLocaleString("ru-RU")}`;
+}
+
+function renderRuleScope() {
+  $("#item-scope").classList.toggle("hidden", ruleScope !== "item");
+  $("#category-scope").classList.toggle("hidden", ruleScope !== "category");
+  $("#rule-scope").querySelectorAll("button").forEach((button) =>
+    button.classList.toggle("active", (button as HTMLButtonElement).dataset.value === ruleScope));
+}
+
+function expandedRules(source = rules): Rule[] {
+  return source.flatMap((rule) => {
+    if (rule.scope !== "category") return [rule];
+    const itemIds = rule.itemIds?.length ? rule.itemIds : catalog.filter((item) => item.category === rule.category).map((item) => item.id);
+    const groupId = `${rule.region}|${rule.category}|${rule.name}`;
+    return itemIds.map((itemId) => {
+      const item = catalog.find((candidate) => candidate.id === itemId);
+      return {
+        ...rule,
+        itemId,
+        name: `${rule.name} · ${item?.nameRu || item?.nameEn || itemId}`,
+        groupId,
+        groupTopN: rule.topN || 1,
+      };
+    });
+  });
+}
+
 function currentRule(): Rule {
-  const itemId = value("item-id");
-  if (!itemId) throw new Error("Выберите предмет или укажите Item ID");
+  const categoryName = $<HTMLSelectElement>("#rule-category").value;
+  const items = categoryItems(categoryName).filter((item) => categorySelectedIds.has(item.id));
+  const itemId = ruleScope === "item" ? value("item-id") : `category:${categoryName}`;
+  if (ruleScope === "item" && !itemId) throw new Error("Выберите предмет или укажите Item ID");
+  if (ruleScope === "category" && !categoryName) throw new Error("Выберите категорию");
+  if (ruleScope === "category" && !items.length) throw new Error("Выберите хотя бы один предмет в категории");
   const selectedQualities = [...document.querySelectorAll<HTMLInputElement>("#quality-options input:checked")].map((checkbox) => checkbox.value as ArtifactQuality);
   const minUpgrade = numberValue("min-upgrade");
   const maxUpgrade = numberValue("max-upgrade");
   if (minUpgrade != null && maxUpgrade != null && minUpgrade > maxUpgrade) throw new Error("Минимальная заточка не может быть больше максимальной");
   return {
-    name: value("rule-name") || selected?.nameRu || itemId,
+    name: value("rule-name") || (ruleScope === "category" ? `Лучшее в ${categoryName}` : selected?.nameRu) || itemId,
     itemId,
     region: $<HTMLSelectElement>("#region").value,
+    scope: ruleScope,
+    category: ruleScope === "category" ? categoryName : undefined,
+    itemIds: ruleScope === "category" ? items.map((item) => item.id) : undefined,
+    topN: ruleScope === "category" ? Number($<HTMLSelectElement>("#category-top").value) : undefined,
     maxBuyout: numberValue("max-buyout"), maxUnitBuyout: numberValue("max-unit"), minAmount: numberValue("min-amount"),
     artifactQualities: selectedQualities, minUpgrade, maxUpgrade,
     maxHistoryMedianRatio: numberValue("history-percent") == null ? undefined : numberValue("history-percent")! / 100,
@@ -394,6 +521,7 @@ function describeRange(label: string, min?: number, max?: number, prefix = "") {
 function describeRule(rule: Rule) {
   const qualities = rule.artifactQualities?.map((value) => artifactQualities.find((quality) => quality.value === value)?.label).filter(Boolean);
   return [
+    rule.scope === "category" ? `${rule.itemIds?.length || 0} предметов · топ ${rule.topN || 1}` : "",
     rule.maxBuyout != null ? `лот ≤ ${money(rule.maxBuyout)}` : "",
     rule.maxUnitBuyout != null ? `шт. ≤ ${money(rule.maxUnitBuyout)}` : "",
     rule.minAmount != null ? `кол-во ≥ ${rule.minAmount}` : "",
@@ -404,17 +532,36 @@ function describeRule(rule: Rule) {
   ].filter(Boolean).join(" · ") || "Без ценовых ограничений";
 }
 
-function switchView(view: "overview" | "config" | "history" | "analytics") {
+function ruleTargetLabel(rule: Rule) {
+  return rule.scope === "category" ? `Категория: ${rule.category}` : rule.itemId;
+}
+
+function switchView(view: "overview" | "config" | "history" | "analytics" | "movement") {
   $("#overview-view").classList.toggle("hidden", view !== "overview");
   $("#config-view").classList.toggle("hidden", view !== "config");
   $("#history-view").classList.toggle("hidden", view !== "history");
   $("#analytics-view").classList.toggle("hidden", view !== "analytics");
+  $("#movement-view").classList.toggle("hidden", view !== "movement");
   document.querySelectorAll<HTMLButtonElement>(".workspace-tabs button").forEach((button) =>
     button.classList.toggle("active", button.dataset.view === view));
   $(".workspace").scrollTop = 0;
 }
 
 function summaryFor(rule: Rule) {
+  if (rule.scope === "category") {
+    const ids = new Set(rule.itemIds || []);
+    const grouped = ruleSummaries.filter((summary) => ids.has(summary.itemId) && summary.region === rule.region);
+    if (!grouped.length) return undefined;
+    return {
+      name: rule.name, itemId: rule.itemId, region: rule.region,
+      totalLots: grouped.reduce((sum, summary) => sum + summary.totalLots, 0),
+      comparableLots: grouped.reduce((sum, summary) => sum + summary.comparableLots, 0),
+      matchingLots: grouped.reduce((sum, summary) => sum + summary.matchingLots, 0),
+      currentMinBuyout: grouped.map((summary) => summary.currentMinBuyout).filter((value): value is number => value != null).sort((a, b) => a - b)[0],
+      currentMinUnit: grouped.map((summary) => summary.currentMinUnit).filter((value): value is number => value != null).sort((a, b) => a - b)[0],
+      checkedAt: grouped[0].checkedAt,
+    } satisfies RuleSummary;
+  }
   return ruleSummaries.find((summary) => summary.itemId === rule.itemId && summary.region === rule.region);
 }
 
@@ -450,7 +597,7 @@ function renderOverview() {
     const limit = rule.maxBuyout ?? rule.maxUnitBuyout;
     const market = rule.maxBuyout != null ? summary.currentMinBuyout : summary.currentMinUnit;
     return `<article class="market-rule ${stateClass}" data-market-rule="${index}">
-      <div class="market-rule-main"><span class="rule-region">${escapeHtml(rule.region)}</span><div><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(rule.itemId)} · ${escapeHtml(describeRule(rule))}</small></div></div>
+      <div class="market-rule-main"><span class="rule-region">${escapeHtml(rule.region)}</span><div><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(ruleTargetLabel(rule))} · ${escapeHtml(describeRule(rule))}</small></div></div>
       <div class="market-state ${stateClass}"><span></span>${stateText}</div>
       <button class="icon-button small market-edit" title="Изменить правило"><i data-lucide="pencil"></i></button>
       <div class="market-metrics">
@@ -704,10 +851,11 @@ function renderAnalytics() {
 
 async function loadAnalytics() {
   if (!rules.length) { toast("Для аналитики нужно хотя бы одно активное правило", true); return; }
+  const analysisRules = expandedRules();
   $("#analytics-load").classList.add("busy");
   $("#analytics-updated").textContent = `Анализирую рынки: ${rules.length}`;
   try {
-    const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules });
+    const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules: analysisRules });
     analyticsInsights = response.insights;
     $("#analytics-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
     renderAnalytics();
@@ -717,12 +865,121 @@ async function loadAnalytics() {
   finally { $("#analytics-load").classList.remove("busy"); }
 }
 
+function movementKey(market: MarketMovement) {
+  return `${market.region}|${market.itemId}`;
+}
+
+function movementItemName(itemId: string) {
+  const item = catalog.find((candidate) => candidate.id === itemId);
+  return item?.nameRu || item?.nameEn || itemId;
+}
+
+function movementSignalClass(signal: string) {
+  if (signal.includes("Дефицит") || signal.includes("исчезают")) return "shortage";
+  if (signal.includes("Перенасыщение")) return "oversupply";
+  if (signal.includes("больше")) return "pending";
+  return "stable";
+}
+
+function renderMovementChart(market: MarketMovement) {
+  movementResizeObserver?.disconnect();
+  movementChart?.remove();
+  const container = $("#movement-chart");
+  container.innerHTML = "";
+  if (!market.points.length) return;
+  movementChart = createChart(container, {
+    width: container.clientWidth, height: 310,
+    layout: { background: { type: ColorType.Solid, color: "#101513" }, textColor: "#899790", attributionLogo: false },
+    grid: { vertLines: { color: "#26302c" }, horzLines: { color: "#26302c" } },
+    leftPriceScale: { visible: true, borderColor: "#35413c", scaleMargins: { top: .12, bottom: .12 } },
+    rightPriceScale: { borderColor: "#35413c", scaleMargins: { top: .12, bottom: .12 } },
+    timeScale: { borderColor: "#35413c", timeVisible: true, secondsVisible: false },
+    localization: { locale: "ru-RU" },
+  });
+  const supply = movementChart.addSeries(LineSeries, {
+    color: "#58b9c6", lineWidth: 2, priceScaleId: "left", pointMarkersVisible: market.points.length < 80,
+    priceLineVisible: false, priceFormat: { type: "custom", formatter: (value: number) => `${Math.round(value)} лотов` },
+  });
+  supply.setData(market.points.map((point) => ({ time: point.time as UTCTimestamp, value: point.supply })));
+  const pricePoints = market.points.filter((point) => point.medianUnit != null)
+    .map((point) => ({ time: point.time as UTCTimestamp, value: point.medianUnit! }));
+  if (pricePoints.length) {
+    const price = movementChart.addSeries(LineSeries, {
+      color: "#e2bd64", lineWidth: 2, priceScaleId: "right", pointMarkersVisible: pricePoints.length < 80,
+      priceLineVisible: false, priceFormat: { type: "custom", formatter: (value: number) => `${money(value)} ₽` },
+    });
+    price.setData(pricePoints);
+  }
+  movementChart.timeScale().fitContent();
+  movementResizeObserver = new ResizeObserver(() => {
+    if (movementChart && container.clientWidth > 0) movementChart.applyOptions({ width: container.clientWidth });
+  });
+  movementResizeObserver.observe(container);
+}
+
+function renderMovementDetail(market?: MarketMovement) {
+  if (!market) {
+    $("#movement-detail").innerHTML = `<div class="movement-empty"><i data-lucide="activity"></i><strong>Пока нет наблюдений</strong><span>Сборщик начнёт строить движение после нескольких проходов</span></div>`;
+    createIcons({ icons: appIcons });
+    return;
+  }
+  const signalClass = movementSignalClass(market.signal);
+  const events = market.events.map((event) => {
+    const labels = { appeared: "Появился", missing: "Исчез", ended: "Завершился" };
+    return `<tr><td><span class="movement-event ${event.kind}">${labels[event.kind]}</span></td><td>${escapeHtml(new Date(event.time).toLocaleString("ru-RU"))}</td><td>${event.amount.toLocaleString("ru-RU")}</td><td>${money(event.unitPrice)} ₽</td><td>${event.lifetimeMinutes == null ? "—" : formatInterval(event.lifetimeMinutes)}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="table-empty">За период событий пока нет</td></tr>`;
+  $("#movement-detail").innerHTML = `
+    <header class="movement-detail-head"><div><span class="rule-region">${escapeHtml(market.region)}</span><div><h3>${escapeHtml(movementItemName(market.itemId))}</h3><small>${escapeHtml(market.itemId)} · последнее наблюдение ${escapeHtml(new Date(market.lastCollected).toLocaleString("ru-RU"))}</small></div></div><span class="movement-signal ${signalClass}">${escapeHtml(market.signal)}</span></header>
+    <div class="movement-metrics"><div><span>Предложение</span><strong>${market.currentSupply.toLocaleString("ru-RU")}</strong><small class="${(market.supplyChangePercent ?? 0) > 0 ? "negative" : "positive"}">${signedPercent(market.supplyChangePercent)}</small></div><div><span>Медиана / шт.</span><strong>${money(market.currentMedianUnit)} ₽</strong><small class="${(market.priceChangePercent ?? 0) > 0 ? "positive" : "negative"}">${signedPercent(market.priceChangePercent)}</small></div><div><span>Минимум / шт.</span><strong>${money(market.currentMinUnit)} ₽</strong><small>${market.collections} проходов</small></div><div><span>Среднее время жизни</span><strong>${formatInterval(market.averageLifetimeMinutes)}</strong><small>исчезнувшие и завершённые</small></div></div>
+    <div class="movement-chart-head"><div><span><i class="supply"></i>Предложение</span><span><i class="price"></i>Медианная цена</span></div><small>Покрытие ${market.coveragePercent.toFixed(0)}%</small></div>
+    <div id="movement-chart"></div>
+    <div class="movement-events"><div class="movement-section-title"><strong>Последние события</strong><span>Исчезновение не гарантирует продажу</span></div><div class="movement-events-scroll"><table><thead><tr><th>Событие</th><th>Время</th><th>Количество</th><th>Цена / шт.</th><th>Время жизни</th></tr></thead><tbody>${events}</tbody></table></div></div>`;
+  renderMovementChart(market);
+}
+
+function renderMovement() {
+  const query = value("movement-search").toLocaleLowerCase("ru");
+  const visibleMarkets = movementMarkets.filter((market) => {
+    const item = catalog.find((candidate) => candidate.id === market.itemId);
+    return `${market.itemId} ${market.region} ${item?.nameRu || ""} ${item?.nameEn || ""} ${item?.category || ""} ${item?.subcategory || ""}`.toLocaleLowerCase("ru").includes(query);
+  });
+  const supply = visibleMarkets.reduce((sum, market) => sum + market.currentSupply, 0);
+  const appeared = visibleMarkets.reduce((sum, market) => sum + market.appeared, 0);
+  const disappeared = visibleMarkets.reduce((sum, market) => sum + market.disappeared, 0);
+  const coverage = visibleMarkets.length ? visibleMarkets.reduce((sum, market) => sum + market.coveragePercent, 0) / visibleMarkets.length : undefined;
+  $("#movement-markets").textContent = visibleMarkets.length ? String(visibleMarkets.length) : "—";
+  $("#movement-supply").textContent = visibleMarkets.length ? supply.toLocaleString("ru-RU") : "—";
+  $("#movement-appeared").textContent = visibleMarkets.length ? appeared.toLocaleString("ru-RU") : "—";
+  $("#movement-disappeared").textContent = visibleMarkets.length ? disappeared.toLocaleString("ru-RU") : "—";
+  $("#movement-coverage").textContent = coverage == null ? "—" : `${coverage.toFixed(0)}%`;
+  if (!visibleMarkets.some((market) => movementKey(market) === selectedMovementKey)) selectedMovementKey = visibleMarkets[0] && movementKey(visibleMarkets[0]);
+  $("#movement-list").innerHTML = visibleMarkets.map((market) => {
+    const key = movementKey(market);
+    return `<button class="movement-market${key === selectedMovementKey ? " active" : ""}" data-item-id="${escapeHtml(market.itemId)}" data-region="${escapeHtml(market.region)}"><div><span class="rule-region">${escapeHtml(market.region)}</span><strong>${escapeHtml(movementItemName(market.itemId))}</strong></div><small>${market.currentSupply.toLocaleString("ru-RU")} лотов · медиана ${money(market.currentMedianUnit)} ₽</small><span class="movement-signal ${movementSignalClass(market.signal)}">${escapeHtml(market.signal)}</span></button>`;
+  }).join("") || `<div class="movement-empty">${movementMarkets.length ? "Ничего не найдено" : "Нет данных за выбранный период"}</div>`;
+  renderMovementDetail(visibleMarkets.find((market) => movementKey(market) === selectedMovementKey));
+}
+
+async function loadMovement() {
+  $("#movement-load").classList.add("busy");
+  try {
+    const response = await invoke<MarketMovementResponse>("market_movement", {
+      hours: Number($<HTMLSelectElement>("#movement-hours").value),
+      region: $<HTMLSelectElement>("#movement-region").value,
+    });
+    movementMarkets = response.markets;
+    $("#movement-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · локальная база`;
+    renderMovement();
+  } catch (error) { toast(String(error), true); log(String(error), true); }
+  finally { $("#movement-load").classList.remove("busy"); }
+}
+
 function renderRules() {
   $("#rule-count").textContent = String(rules.length);
   $("#stat-rules").textContent = String(rules.length);
   $("#rules-list").innerHTML = rules.map((rule, index) => `
     <article class="rule-row${editingIndex === index ? " editing" : ""}" data-index="${index}">
-      <span class="rule-region">${escapeHtml(rule.region)}</span><div><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(rule.itemId)} · ${escapeHtml(describeRule(rule))}</small></div>
+      <span class="rule-region">${escapeHtml(rule.region)}</span><div><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(ruleTargetLabel(rule))} · ${escapeHtml(describeRule(rule))}</small></div>
       <button class="icon-button small edit-rule" title="Изменить"><i data-lucide="pencil"></i></button><button class="icon-button small delete-rule" title="Удалить"><i data-lucide="trash-2"></i></button>
     </article>`).join("") || `<div class="empty-inline">Правил пока нет. Выберите предмет и задайте условия.</div>`;
   createIcons({ icons: appIcons });
@@ -730,6 +987,12 @@ function renderRules() {
 }
 
 function setForm(rule?: Rule) {
+  ruleScope = rule?.scope || "item";
+  categorySelectedIds = new Set(rule?.itemIds || []);
+  input("category-item-search").value = "";
+  updateRuleCategoryOptions(rule?.category);
+  $<HTMLSelectElement>("#category-top").value = String(rule?.topN || 1);
+  renderRuleScope();
   const fields: [string, string | number | undefined][] = [
     ["rule-name", rule?.name], ["item-id", rule?.itemId], ["max-buyout", rule?.maxBuyout], ["max-unit", rule?.maxUnitBuyout], ["min-amount", rule?.minAmount],
     ["min-upgrade", rule?.minUpgrade], ["max-upgrade", rule?.maxUpgrade],
@@ -757,7 +1020,7 @@ async function persistRules(showToast = true) {
 function renderMatches() {
   $("#stat-found").textContent = String(matches.length);
   $("#matches").innerHTML = matches.map((match, index) => `
-    <button class="match-row" data-match="${index}"><div><strong>${escapeHtml(match.name)}</strong><span>${escapeHtml(match.region)}${match.quality ? ` · ${escapeHtml(match.quality)}` : ""}${match.upgrade != null ? ` · +${match.upgrade}` : ""}</span></div><b>${money(match.buyout)} ₽</b><small>${match.amount} шт. · ${money(match.unit)} за шт.</small></button>`).join("") || `<div class="empty-state compact"><i data-lucide="bell"></i><p>Подходящие лоты появятся здесь</p></div>`;
+    <button class="match-row" data-match="${index}"><div><strong>${escapeHtml(match.name)}</strong><span>${escapeHtml(match.region)}${match.quality ? ` · ${escapeHtml(match.quality)}` : ""}${match.upgrade != null ? ` · +${match.upgrade}` : ""}</span></div><b>${money(match.buyout)} ₽</b><small>${match.amount} шт. · ${money(match.unit)} за шт.${match.dealRatio != null ? ` · ${Math.round((1 - match.dealRatio) * 100)}% к медиане` : ""}</small></button>`).join("") || `<div class="empty-state compact"><i data-lucide="bell"></i><p>Подходящие лоты появятся здесь</p></div>`;
   createIcons({ icons: appIcons });
 }
 
@@ -775,7 +1038,8 @@ async function runCheck(manual = false) {
   $("#overview-check").classList.add("busy");
   $("#overview-updated").textContent = "Получаю данные аукциона...";
   try {
-    const result = await invoke<CheckResult>("check_rules", { rules, notifyExisting: true, includeSeen: manual });
+    const checkRules = expandedRules();
+    const result = await invoke<CheckResult>("check_rules", { rules: checkRules, notifyExisting: true, includeSeen: manual });
     ruleSummaries = result.summaries;
     const combined = [...result.matches, ...matches];
     matches = combined.filter((match, index) => combined.findIndex((candidate) =>
@@ -812,7 +1076,9 @@ function toggleMonitor() {
     $("#overview-mode").textContent = "мониторинг выключен";
     button.innerHTML = `<i data-lucide="play"></i> Запустить`; log("Мониторинг остановлен");
   } else {
-    const seconds = Math.max(10, numberValue("interval") || 60);
+    const minimum = rules.some((rule) => rule.scope === "category") ? 300 : 10;
+    const seconds = Math.max(minimum, numberValue("interval") || 60);
+    input("interval").value = String(seconds);
     void runCheck();
     monitorTimer = window.setInterval(() => void runCheck(), seconds * 1000);
     nextCheckAt = Date.now() + seconds * 1000;
@@ -836,8 +1102,34 @@ $("#category-tabs").addEventListener("click", (event) => {
 $("#catalog-list").addEventListener("click", (event) => {
   const row = (event.target as HTMLElement).closest<HTMLElement>("[data-id]"); const item = catalog.find((entry) => entry.id === row?.dataset.id); if (item) void selectItem(item);
 });
-$("#use-item").addEventListener("click", () => { if (!selected) return; switchView("config"); input("item-id").value = selected.id; input("rule-name").value = selected.nameRu || selected.nameEn || selected.id; input("rule-name").focus(); });
+$("#use-item").addEventListener("click", () => { if (!selected) return; ruleScope = "item"; renderRuleScope(); switchView("config"); input("item-id").value = selected.id; input("rule-name").value = selected.nameRu || selected.nameEn || selected.id; input("rule-name").focus(); });
 $("#item-history").addEventListener("click", () => { if (selected) openHistory(selected); });
+$("#rule-scope").addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button");
+  if (!button) return;
+  ruleScope = button.dataset.value as "item" | "category";
+  renderRuleScope();
+});
+$("#rule-category").addEventListener("change", () => {
+  categorySelectedIds.clear();
+  input("category-item-search").value = "";
+  renderCategoryItemSelector();
+});
+input("category-item-search").addEventListener("input", renderCategoryItemSelector);
+$("#category-item-list").addEventListener("change", (event) => {
+  const checkbox = (event.target as HTMLElement).closest<HTMLInputElement>("input[type=checkbox]");
+  if (!checkbox) return;
+  if (checkbox.checked) categorySelectedIds.add(checkbox.value); else categorySelectedIds.delete(checkbox.value);
+  updateCategoryCount();
+});
+$("#category-select-visible").addEventListener("click", () => {
+  visibleCategoryItems().forEach((item) => categorySelectedIds.add(item.id));
+  renderCategoryItemSelector();
+});
+$("#category-clear-items").addEventListener("click", () => {
+  categorySelectedIds.clear();
+  renderCategoryItemSelector();
+});
 $("#clear-form").addEventListener("click", () => { editingIndex = undefined; setForm(); renderRules(); });
 $("#clear-artifact").addEventListener("click", () => {
   document.querySelectorAll<HTMLInputElement>("#quality-options input").forEach((checkbox) => checkbox.checked = false);
@@ -853,20 +1145,21 @@ $("#upsert").addEventListener("click", () => {
     ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === rule.itemId && summary.region === rule.region));
     analyticsInsights = [];
     if (editingIndex != null) rules[editingIndex] = rule;
-    else { const duplicate = rules.findIndex((entry) => entry.itemId === rule.itemId && entry.region === rule.region); if (duplicate >= 0) rules[duplicate] = rule; else rules.push(rule); }
+    else { const duplicate = rules.findIndex((entry) => ruleTargetLabel(entry) === ruleTargetLabel(rule) && entry.region === rule.region); if (duplicate >= 0) rules[duplicate] = rule; else rules.push(rule); }
     editingIndex = undefined; setForm(); renderRules(); void persistRules(false); toast("Правило добавлено");
   } catch (error) { toast(String(error), true); }
 });
 $("#rules-list").addEventListener("click", (event) => {
   const row = (event.target as HTMLElement).closest<HTMLElement>("[data-index]"); if (!row) return;
   const index = Number(row.dataset.index);
-  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === removed.itemId && summary.region === removed.region)); analyticsInsights = []; editingIndex = undefined; renderRules(); renderAnalytics(); void persistRules(false); return; }
+  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; const removedIds = new Set(removed.itemIds || [removed.itemId]); rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(removedIds.has(summary.itemId) && summary.region === removed.region)); analyticsInsights = []; editingIndex = undefined; renderRules(); renderAnalytics(); void persistRules(false); return; }
   editingIndex = index; setForm(rules[index]); renderRules(); $(".rule-editor").scrollIntoView({ behavior: "smooth" });
 });
 $("#save").addEventListener("click", () => void persistRules());
 $("#analyze").addEventListener("click", async () => {
   try {
     const rule = currentRule(); $("#analyze").classList.add("busy");
+    if (rule.scope === "category") throw new Error("Добавьте групповое правило и используйте вкладку «Аналитика» для сравнения категории");
     const result = await invoke<MarketAnalysis>("analyze_market", { rule });
     $("#analysis-content").innerHTML = `<div class="analysis-grid"><div><span>Активных лотов</span><strong>${result.lots}</strong></div><div><span>Продаж в истории</span><strong>${result.history}</strong></div><div><span>Текущий минимум / шт.</span><strong>${money(result.currentMin)} ₽</strong></div><div><span>Медиана активных / шт.</span><strong>${money(result.currentMedian)} ₽</strong></div><div class="wide"><span>Медиана продаж / шт.</span><strong>${money(result.historyMedian)} ₽</strong></div></div>${result.historyMedian != null ? `<div class="recommendations"><span>Ориентиры</span><button data-price="${Math.round(result.historyMedian * .8)}">80% · ${money(result.historyMedian * .8)} ₽</button><button data-price="${Math.round(result.historyMedian * .9)}">90% · ${money(result.historyMedian * .9)} ₽</button></div>` : ""}`;
     $<HTMLDialogElement>("#analysis-dialog").showModal();
@@ -878,9 +1171,10 @@ $("#check-once").addEventListener("click", () => void runCheck(true));
 $("#overview-check").addEventListener("click", () => void runCheck(true));
 $(".workspace-tabs").addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-view]"); if (!button) return;
-  const view = button.dataset.view as "overview" | "config" | "history" | "analytics";
+  const view = button.dataset.view as "overview" | "config" | "history" | "analytics" | "movement";
   if (view === "history" && selected && historyItem?.id !== selected.id) openHistory(selected); else switchView(view);
   if (view === "analytics" && !analyticsInsights.length && rules.length) void loadAnalytics();
+  if (view === "movement" && !movementMarkets.length) void loadMovement();
 });
 $("#market-rules").addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest("[data-open-config]")) { switchView("config"); return; }
@@ -921,6 +1215,15 @@ $("#history-reset").addEventListener("click", () => {
 updateHistorySourceControls();
 $("#analytics-load").addEventListener("click", () => void loadAnalytics());
 ["analytics-region", "analytics-signal", "analytics-sort"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderAnalytics));
+$("#movement-load").addEventListener("click", () => void loadMovement());
+["movement-hours", "movement-region"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", () => void loadMovement()));
+input("movement-search").addEventListener("input", renderMovement);
+$("#movement-list").addEventListener("click", (event) => {
+  const row = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-item-id]");
+  if (!row) return;
+  selectedMovementKey = `${row.dataset.region}|${row.dataset.itemId}`;
+  renderMovement();
+});
 $("#analytics-list").addEventListener("click", (event) => {
   const card = (event.target as HTMLElement).closest<HTMLElement>("[data-insight-id]"); if (!card) return;
   const itemId = card.dataset.insightId!; const region = card.dataset.insightRegion!;
