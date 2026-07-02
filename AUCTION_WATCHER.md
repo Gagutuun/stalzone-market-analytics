@@ -42,6 +42,13 @@ disappeared lots, average observed lifetime, collection coverage, market-state
 signals, and a recent lifecycle event log. A disappeared lot is not presented as
 a confirmed sale because the public auction response does not expose that fact.
 
+Missing lots are reconciled with official sales using a one-to-one probabilistic
+match over item, region, amount, price, artifact quality, upgrade level, and a
+bounded time window. A matched lifecycle is labelled `probable_sold` together
+with its confidence; the underlying sale remains an official API record, while
+the identity link remains explicitly probabilistic because active lots have no
+shared `lotId` with sales history.
+
 ## Local market archive
 
 Sales used by analytics are stored in `market_cache.sqlite3`. The file is kept

@@ -168,6 +168,7 @@ struct MovementEvent {
     buyout: Option<i64>,
     unit_price: Option<f64>,
     lifetime_minutes: Option<f64>,
+    confidence: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -182,6 +183,9 @@ struct MarketMovement {
     price_change_percent: Option<f64>,
     appeared: u64,
     disappeared: u64,
+    official_sales: u64,
+    probable_sales: u64,
+    unexplained_missing: u64,
     ended: u64,
     active_lots: u64,
     average_lifetime_minutes: Option<f64>,
@@ -404,9 +408,118 @@ fn prepare_cache(connection: &Connection) -> Result<(), String> {
            region TEXT NOT NULL,
            last_history_sync INTEGER NOT NULL,
            PRIMARY KEY (item_id, region)
-         );"
+         );
+         CREATE TABLE IF NOT EXISTS lot_sale_matches (
+           lot_key TEXT PRIMARY KEY,
+           sale_fingerprint TEXT NOT NULL UNIQUE,
+           confidence REAL NOT NULL,
+           matched_at TEXT NOT NULL,
+           matched_timestamp INTEGER NOT NULL,
+           price_delta_percent REAL,
+           time_delta_seconds INTEGER,
+           FOREIGN KEY (lot_key) REFERENCES tracked_lots(lot_key),
+           FOREIGN KEY (sale_fingerprint) REFERENCES sales(fingerprint)
+         );
+         CREATE INDEX IF NOT EXISTS sale_matches_time ON lot_sale_matches(matched_timestamp DESC);"
     ).map_err(|error| format!("Не удалось подготовить локальную базу: {error}"))?;
     Ok(())
+}
+
+fn match_missing_lots_to_sales(item_id: &str, region: &str) -> Result<usize, String> {
+    let mut connection = open_cache()?;
+    match_missing_lots_to_sales_in(&mut connection, item_id, region, chrono::Utc::now())
+}
+
+fn match_missing_lots_to_sales_in(
+    connection: &mut Connection,
+    item_id: &str,
+    region: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, String> {
+    type MissingLot = (String, i64, i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+    type SaleCandidate = (String, i64, i64, i64, Option<i64>, Option<i64>);
+    let region = region.to_ascii_uppercase();
+    let missing_lots: Vec<MissingLot> = {
+        let mut statement = connection.prepare(
+            "SELECT t.lot_key, t.last_seen_timestamp, t.missing_since_timestamp, t.amount,
+                    t.buyout_price, t.current_price, t.quality_code, t.upgrade
+             FROM tracked_lots t LEFT JOIN lot_sale_matches m ON m.lot_key = t.lot_key
+             WHERE t.item_id = ?1 AND t.region = ?2 AND t.status = 'missing'
+               AND t.missing_since_timestamp IS NOT NULL AND m.lot_key IS NULL
+             ORDER BY t.missing_since_timestamp"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map(params![item_id, &region], |row| Ok((
+            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?
+        ))).map_err(|error| error.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let mut matched = 0;
+    for (lot_key, last_seen, missing_since, lot_amount, buyout, current, quality, upgrade) in missing_lots {
+        let candidates: Vec<SaleCandidate> = {
+            let mut statement = transaction.prepare(
+                "SELECT s.fingerprint, s.sold_timestamp, s.amount, s.price, s.quality_code, s.upgrade
+                 FROM sales s LEFT JOIN lot_sale_matches m ON m.sale_fingerprint = s.fingerprint
+                 WHERE s.item_id = ?1 AND s.region = ?2 AND s.sold_timestamp BETWEEN ?3 AND ?4
+                   AND s.amount = ?5 AND m.sale_fingerprint IS NULL"
+            ).map_err(|error| error.to_string())?;
+            let rows = statement.query_map(
+                params![item_id, &region, last_seen - 60, missing_since + 120, lot_amount],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            ).map_err(|error| error.to_string())?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let mut scored: Vec<(f64, i64, f64, String)> = candidates.into_iter().filter_map(
+            |(fingerprint, sold_at, _, sale_price, sale_quality, sale_upgrade)| {
+                if quality.is_some() && quality != sale_quality { return None; }
+                if upgrade.is_some() && upgrade != sale_upgrade { return None; }
+                let reference = buyout.filter(|price| *price > 0).or(current.filter(|price| *price > 0))?;
+                let price_delta = (sale_price - reference).abs() as f64 / reference as f64 * 100.0;
+                let mut confidence: f64 = if sale_price == reference { 0.90 } else if price_delta <= 1.0 { 0.84 } else if price_delta <= 5.0 { 0.72 } else { return None };
+                if quality.is_some() && quality == sale_quality { confidence += 0.04; }
+                if upgrade.is_some() && upgrade == sale_upgrade { confidence += 0.04; }
+                let time_delta = (sold_at - missing_since).abs();
+                if time_delta <= 60 { confidence += 0.02; }
+                Some((confidence.min(0.99), time_delta, price_delta, fingerprint))
+            }
+        ).collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let Some((mut confidence, time_delta, price_delta, fingerprint)) = scored.first().cloned() else { continue };
+        if scored.get(1).is_some_and(|second| (confidence - second.0).abs() < 0.02) { confidence -= 0.08; }
+        if confidence < 0.75 { continue; }
+        transaction.execute(
+            "INSERT OR IGNORE INTO lot_sale_matches
+             (lot_key, sale_fingerprint, confidence, matched_at, matched_timestamp, price_delta_percent, time_delta_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![&lot_key, &fingerprint, confidence, now.to_rfc3339(), now.timestamp(), price_delta, time_delta]
+        ).map_err(|error| error.to_string())?;
+        transaction.execute(
+            "UPDATE tracked_lots SET status = 'probable_sold' WHERE lot_key = ?1 AND status = 'missing'",
+            params![&lot_key]
+        ).map_err(|error| error.to_string())?;
+        matched += 1;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(matched)
+}
+
+fn reconcile_all_sale_matches() -> Result<usize, String> {
+    let connection = open_cache()?;
+    let markets: Vec<(String, String)> = {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT item_id, region FROM tracked_lots WHERE status = 'missing'"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    drop(connection);
+    let mut matched = 0;
+    for (item_id, region) in markets {
+        matched += match_missing_lots_to_sales(&item_id, &region)?;
+    }
+    Ok(matched)
 }
 
 fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usize, String> {
@@ -414,6 +527,7 @@ fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usiz
     let mut connection = open_cache()?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
     let mut inserted = 0;
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
     {
         let mut statement = transaction.prepare(
             "INSERT OR IGNORE INTO sales
@@ -425,7 +539,10 @@ fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usiz
             let Some(timestamp) = chrono::DateTime::parse_from_rfc3339(time).ok().map(|value| value.timestamp()) else { continue };
             let Some(row_price) = price(row, "price").filter(|value| *value > 0) else { continue };
             let raw = serde_json::to_string(row).map_err(|error| error.to_string())?;
-            let fingerprint = format!("{:x}", Sha256::digest(format!("{region}|{item_id}|{raw}").as_bytes()));
+            let base = format!("{:x}", Sha256::digest(format!("{region}|{item_id}|{raw}").as_bytes()));
+            let occurrence = occurrences.entry(base.clone()).or_default();
+            let fingerprint = if *occurrence == 0 { base } else { format!("{base}#{}", *occurrence) };
+            *occurrence += 1;
             inserted += statement.execute(params![
                 fingerprint, item_id, &region, time, timestamp, amount(row), row_price,
                 lot_quality_code(row), lot_upgrade(row), raw
@@ -433,6 +550,7 @@ fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usiz
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
+    match_missing_lots_to_sales(item_id, &region)?;
     Ok(inserted)
 }
 
@@ -924,6 +1042,7 @@ fn collection_unit_prices(connection: &Connection, collection_id: i64) -> Result
 
 #[tauri::command]
 fn market_movement(hours: i64, region: String) -> Result<MarketMovementResponse, String> {
+    reconcile_all_sale_matches()?;
     let connection = open_cache()?;
     market_movement_from(&connection, hours, region, chrono::Utc::now())
 }
@@ -995,6 +1114,20 @@ fn market_movement_from(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND missing_since_timestamp >= ?3",
             params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
+        let official_sales = connection.query_row(
+            "SELECT COUNT(*) FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
+        let probable_sales = connection.query_row(
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2
+             AND status = 'probable_sold' AND missing_since_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
+        let unexplained_missing = connection.query_row(
+            "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2
+             AND status = 'missing' AND missing_since_timestamp >= ?3",
+            params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
+        ).unwrap_or_default();
         let ended = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'ended' AND end_timestamp >= ?3",
             params![&item_id, &market_region, cutoff], |row| row.get::<_, u64>(0)
@@ -1005,43 +1138,47 @@ fn market_movement_from(
         ).unwrap_or_default();
         let average_lifetime_minutes = connection.query_row(
             "SELECT AVG(CASE
-               WHEN status = 'missing' THEN missing_since_timestamp - first_seen_timestamp
+               WHEN status IN ('missing', 'probable_sold') THEN missing_since_timestamp - first_seen_timestamp
                WHEN status = 'ended' THEN end_timestamp - first_seen_timestamp END) / 60.0
-             FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status IN ('missing', 'ended')
+             FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status IN ('missing', 'probable_sold', 'ended')
                AND COALESCE(missing_since_timestamp, end_timestamp) >= ?3",
             params![&item_id, &market_region, cutoff], |row| row.get::<_, Option<f64>>(0)
         ).unwrap_or(None);
         let mut events = Vec::new();
         {
             let mut statement = connection.prepare(
-                "SELECT first_seen_at, first_seen_timestamp, missing_since_at, missing_since_timestamp,
-                        status, end_time, end_timestamp, amount, buyout_price
-                 FROM tracked_lots WHERE item_id = ?1 AND region = ?2
+                "SELECT t.first_seen_at, t.first_seen_timestamp, t.missing_since_at, t.missing_since_timestamp,
+                        t.status, t.end_time, t.end_timestamp, t.amount, t.buyout_price, m.confidence, s.sold_at
+                 FROM tracked_lots t
+                 LEFT JOIN lot_sale_matches m ON m.lot_key = t.lot_key
+                 LEFT JOIN sales s ON s.fingerprint = m.sale_fingerprint
+                 WHERE t.item_id = ?1 AND t.region = ?2
                    AND (first_seen_timestamp >= ?3 OR missing_since_timestamp >= ?3
                         OR (status = 'ended' AND end_timestamp >= ?3))
                  ORDER BY MAX(first_seen_timestamp, COALESCE(missing_since_timestamp, 0), COALESCE(end_timestamp, 0)) DESC
                  LIMIT 100"
             ).map_err(|error| error.to_string())?;
-            type EventRow = (String, i64, Option<String>, Option<i64>, String, Option<String>, Option<i64>, i64, Option<i64>);
+            type EventRow = (String, i64, Option<String>, Option<i64>, String, Option<String>, Option<i64>, i64, Option<i64>, Option<f64>, Option<String>);
             let rows = statement.query_map(params![&item_id, &market_region, cutoff], |row| Ok(EventRow::from((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?
             )))).map_err(|error| error.to_string())?;
             for row in rows.filter_map(Result::ok) {
-                let (first_at, first_ts, missing_at, missing_ts, status, end_at, end_ts, amount, buyout) = row;
+                let (first_at, first_ts, missing_at, missing_ts, status, end_at, end_ts, amount, buyout, confidence, sold_at) = row;
                 let unit_price = buyout.filter(|price| *price > 0).filter(|_| amount > 0).map(|price| price as f64 / amount as f64);
                 if first_ts >= cutoff {
-                    events.push(MovementEvent { kind: "appeared".into(), time: first_at, amount, buyout, unit_price, lifetime_minutes: None });
+                    events.push(MovementEvent { kind: "appeared".into(), time: first_at, amount, buyout, unit_price, lifetime_minutes: None, confidence: None });
                 }
-                if status == "missing" {
+                if status == "missing" || status == "probable_sold" {
                     if let (Some(time), Some(timestamp)) = (missing_at, missing_ts) {
-                        events.push(MovementEvent { kind: "missing".into(), time, amount, buyout, unit_price,
-                            lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0) });
+                        events.push(MovementEvent { kind: if status == "probable_sold" { "probable_sale".into() } else { "missing".into() },
+                            time: sold_at.unwrap_or(time), amount, buyout, unit_price,
+                            lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0), confidence });
                     }
                 } else if status == "ended" {
                     if let (Some(time), Some(timestamp)) = (end_at, end_ts) {
                         events.push(MovementEvent { kind: "ended".into(), time, amount, buyout, unit_price,
-                            lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0) });
+                            lifetime_minutes: Some((timestamp - first_ts).max(0) as f64 / 60.0), confidence: None });
                     }
                 }
             }
@@ -1071,7 +1208,7 @@ fn market_movement_from(
             supply_change_percent,
             current_min_unit: last.and_then(|point| point.min_unit),
             current_median_unit: last.and_then(|point| point.median_unit),
-            price_change_percent, appeared, disappeared, ended, active_lots,
+            price_change_percent, appeared, disappeared, official_sales, probable_sales, unexplained_missing, ended, active_lots,
             average_lifetime_minutes, collections: collection_stats.0,
             coverage_percent: collection_stats.1 as f64 / collection_stats.0 as f64 * 100.0,
             last_collected, signal, points, events,
@@ -1222,6 +1359,8 @@ fn record_market_collection(rule: &WatchRule, lots: &[Value], api_total: u64, co
         ).map_err(|error| error.to_string())?;
     }
     for (lot, key) in lots.iter().zip(tracked_lot_keys(rule, lots)) {
+        transaction.execute("DELETE FROM lot_sale_matches WHERE lot_key = ?1", params![&key])
+            .map_err(|error| error.to_string())?;
         let raw = serde_json::to_string(lot).map_err(|error| error.to_string())?;
         let end_time = lot.get("endTime").and_then(Value::as_str);
         let end_timestamp = end_time.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()).map(|value| value.timestamp());
@@ -1262,7 +1401,9 @@ fn record_market_collection(rule: &WatchRule, lots: &[Value], api_total: u64, co
             params![now.to_rfc3339(), now.timestamp(), rule.item_id, &region]
         ).map_err(|error| error.to_string())?;
     }
-    transaction.commit().map_err(|error| error.to_string())
+    transaction.commit().map_err(|error| error.to_string())?;
+    match_missing_lots_to_sales(&rule.item_id, &region)?;
+    Ok(())
 }
 
 fn recent_history_sync_due(item_id: &str, region: &str, now: i64) -> Result<bool, String> {
@@ -1556,6 +1697,37 @@ mod tests {
         assert_eq!(market.coverage_percent, 100.0);
         assert_eq!(market.signal, "Дефицит усиливается");
         assert!(market.events.iter().any(|event| event.kind == "missing"));
+    }
+
+    #[test]
+    fn missing_lot_matches_one_official_sale_with_confidence() {
+        let mut connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        connection.execute(
+            "INSERT INTO tracked_lots
+             (lot_key, item_id, region, first_seen_at, first_seen_timestamp, last_seen_at, last_seen_timestamp,
+              missing_since_at, missing_since_timestamp, status, observation_count, amount, buyout_price,
+              quality_code, upgrade, raw_json)
+             VALUES ('lot', 'item', 'RU', ?1, ?2, ?3, ?4, ?5, ?6, 'missing', 2, 1, 100, 2, 15, '{}')",
+            params![
+                (now - chrono::Duration::hours(1)).to_rfc3339(), now.timestamp() - 3_600,
+                (now - chrono::Duration::minutes(10)).to_rfc3339(), now.timestamp() - 600,
+                now.to_rfc3339(), now.timestamp()
+            ]
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sales
+             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json)
+             VALUES ('sale', 'item', 'RU', ?1, ?2, 1, 100, 2, 15, '{}')",
+            params![(now - chrono::Duration::seconds(30)).to_rfc3339(), now.timestamp() - 30]
+        ).unwrap();
+
+        assert_eq!(match_missing_lots_to_sales_in(&mut connection, "item", "RU", now).unwrap(), 1);
+        let status: String = connection.query_row("SELECT status FROM tracked_lots WHERE lot_key = 'lot'", [], |row| row.get(0)).unwrap();
+        let confidence: f64 = connection.query_row("SELECT confidence FROM lot_sale_matches WHERE lot_key = 'lot'", [], |row| row.get(0)).unwrap();
+        assert_eq!(status, "probable_sold");
+        assert!(confidence >= 0.95);
     }
 
     #[test]

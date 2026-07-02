@@ -93,11 +93,11 @@ type MarketInsight = {
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
 type MovementPoint = { time: number; supply: number; minUnit?: number; medianUnit?: number };
-type MovementEvent = { kind: "appeared" | "missing" | "ended"; time: string; amount: number; buyout?: number; unitPrice?: number; lifetimeMinutes?: number };
+type MovementEvent = { kind: "appeared" | "missing" | "ended" | "probable_sale"; time: string; amount: number; buyout?: number; unitPrice?: number; lifetimeMinutes?: number; confidence?: number };
 type MarketMovement = {
   itemId: string; region: string; currentSupply: number; supplyChangePercent?: number;
   currentMinUnit?: number; currentMedianUnit?: number; priceChangePercent?: number;
-  appeared: number; disappeared: number; ended: number; activeLots: number;
+  appeared: number; disappeared: number; officialSales: number; probableSales: number; unexplainedMissing: number; ended: number; activeLots: number;
   averageLifetimeMinutes?: number; collections: number; coveragePercent: number;
   lastCollected: string; signal: string; points: MovementPoint[]; events: MovementEvent[];
 };
@@ -851,7 +851,7 @@ function recommendationFor(insight: MarketInsight): MarketRecommendation {
       : "Недостаточно данных для сравнения с медианой.",
     `Тренд ${signedPercent(insight.trendPercent)}, ликвидность ${insight.liquidity.toLocaleLowerCase("ru")}, разброс ${signedPercent(insight.volatilityPercent)}.`,
   ];
-  if (supplyChange != null) reasons.push(`Предложение за 24 часа ${signedPercent(supplyChange)}, медианная цена ${signedPercent(priceMovement)}.`);
+  if (supplyChange != null) reasons.push(`Предложение за 24 часа ${signedPercent(supplyChange)}, медианная цена ${signedPercent(priceMovement)}; официальных продаж ${movement?.officialSales ?? 0}.`);
   if (insight.risks.length) reasons.push(`Риски: ${insight.risks.join(", ").toLocaleLowerCase("ru")}.`);
   const fair = insight.medianUnit;
   const targetLow = fair == null ? undefined : roundRecommendationPrice(Math.max(fair * .75, Math.min(insight.p25Unit ?? fair * .85, fair * .85)));
@@ -1010,12 +1010,14 @@ function renderMovementDetail(market?: MarketMovement) {
   }
   const signalClass = movementSignalClass(market.signal);
   const events = market.events.map((event) => {
-    const labels = { appeared: "Появился", missing: "Исчез", ended: "Завершился" };
-    return `<tr><td><span class="movement-event ${event.kind}">${labels[event.kind]}</span></td><td>${escapeHtml(new Date(event.time).toLocaleString("ru-RU"))}</td><td>${event.amount.toLocaleString("ru-RU")}</td><td>${money(event.unitPrice)} ₽</td><td>${event.lifetimeMinutes == null ? "—" : formatInterval(event.lifetimeMinutes)}</td></tr>`;
+    const labels = { appeared: "Появился", missing: "Исчез", ended: "Завершился", probable_sale: "Вероятно продан" };
+    const confidence = event.confidence == null ? "" : ` · ${Math.round(event.confidence * 100)}%`;
+    return `<tr><td><span class="movement-event ${event.kind}">${labels[event.kind]}${confidence}</span></td><td>${escapeHtml(new Date(event.time).toLocaleString("ru-RU"))}</td><td>${event.amount.toLocaleString("ru-RU")}</td><td>${money(event.unitPrice)} ₽</td><td>${event.lifetimeMinutes == null ? "—" : formatInterval(event.lifetimeMinutes)}</td></tr>`;
   }).join("") || `<tr><td colspan="5" class="table-empty">За период событий пока нет</td></tr>`;
   $("#movement-detail").innerHTML = `
     <header class="movement-detail-head"><div><span class="rule-region">${escapeHtml(market.region)}</span><div><h3>${escapeHtml(movementItemName(market.itemId))}</h3><small>${escapeHtml(market.itemId)} · последнее наблюдение ${escapeHtml(new Date(market.lastCollected).toLocaleString("ru-RU"))}</small></div></div><span class="movement-signal ${signalClass}">${escapeHtml(market.signal)}</span></header>
     <div class="movement-metrics"><div><span>Предложение</span><strong>${market.currentSupply.toLocaleString("ru-RU")}</strong><small class="${(market.supplyChangePercent ?? 0) > 0 ? "negative" : "positive"}">${signedPercent(market.supplyChangePercent)}</small></div><div><span>Медиана / шт.</span><strong>${money(market.currentMedianUnit)} ₽</strong><small class="${(market.priceChangePercent ?? 0) > 0 ? "positive" : "negative"}">${signedPercent(market.priceChangePercent)}</small></div><div><span>Минимум / шт.</span><strong>${money(market.currentMinUnit)} ₽</strong><small>${market.collections} проходов</small></div><div><span>Среднее время жизни</span><strong>${formatInterval(market.averageLifetimeMinutes)}</strong><small>исчезнувшие и завершённые</small></div></div>
+    <div class="movement-quality"><div><span>Официальных продаж</span><strong>${market.officialSales.toLocaleString("ru-RU")}</strong></div><div><span>Вероятно сопоставлено</span><strong>${market.probableSales.toLocaleString("ru-RU")}</strong></div><div><span>Необъяснённо исчезло</span><strong>${market.unexplainedMissing.toLocaleString("ru-RU")}</strong></div><div><span>Полнота обходов</span><strong>${market.coveragePercent.toFixed(0)}%</strong></div></div>
     <div class="movement-chart-head"><div><span><i class="supply"></i>Предложение</span><span><i class="price"></i>Медианная цена</span></div><small>Покрытие ${market.coveragePercent.toFixed(0)}%</small></div>
     <div id="movement-chart"></div>
     <div class="movement-events"><div class="movement-section-title"><strong>Последние события</strong><span>Исчезновение не гарантирует продажу</span></div><div class="movement-events-scroll"><table><thead><tr><th>Событие</th><th>Время</th><th>Количество</th><th>Цена / шт.</th><th>Время жизни</th></tr></thead><tbody>${events}</tbody></table></div></div>`;
@@ -1040,7 +1042,7 @@ function renderMovement() {
   if (!visibleMarkets.some((market) => movementKey(market) === selectedMovementKey)) selectedMovementKey = visibleMarkets[0] && movementKey(visibleMarkets[0]);
   $("#movement-list").innerHTML = visibleMarkets.map((market) => {
     const key = movementKey(market);
-    return `<button class="movement-market${key === selectedMovementKey ? " active" : ""}" data-item-id="${escapeHtml(market.itemId)}" data-region="${escapeHtml(market.region)}"><div><span class="rule-region">${escapeHtml(market.region)}</span><strong>${escapeHtml(movementItemName(market.itemId))}</strong></div><small>${market.currentSupply.toLocaleString("ru-RU")} лотов · медиана ${money(market.currentMedianUnit)} ₽</small><span class="movement-signal ${movementSignalClass(market.signal)}">${escapeHtml(market.signal)}</span></button>`;
+    return `<button class="movement-market${key === selectedMovementKey ? " active" : ""}" data-item-id="${escapeHtml(market.itemId)}" data-region="${escapeHtml(market.region)}"><div><span class="rule-region">${escapeHtml(market.region)}</span><strong>${escapeHtml(movementItemName(market.itemId))}</strong></div><small>${market.currentSupply.toLocaleString("ru-RU")} лотов · ${market.officialSales.toLocaleString("ru-RU")} продаж · медиана ${money(market.currentMedianUnit)} ₽</small><span class="movement-signal ${movementSignalClass(market.signal)}">${escapeHtml(market.signal)}</span></button>`;
   }).join("") || `<div class="movement-empty">${movementMarkets.length ? "Ничего не найдено" : "Нет данных за выбранный период"}</div>`;
   renderMovementDetail(visibleMarkets.find((market) => movementKey(market) === selectedMovementKey));
 }
