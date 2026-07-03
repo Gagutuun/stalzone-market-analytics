@@ -15,6 +15,7 @@ const ITEMS_BASE: &str = "https://raw.githubusercontent.com/EXBO-Studio/stalzone
 const CONFIG_FILE: &str = "auction_watchlist.json";
 const STATE_FILE: &str = ".auction_seen.json";
 const CACHE_FILE: &str = "market_cache.sqlite3";
+const SCHISTORY_BASE: &str = "https://schistory.xyz/api";
 
 struct AppState {
     check_lock: tokio::sync::Mutex<()>,
@@ -108,6 +109,7 @@ struct SalesHistoryEntry {
     quality: Option<String>,
     quality_code: Option<i64>,
     upgrade: Option<i64>,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -358,6 +360,36 @@ struct CacheSyncResponse {
     fetched_pages: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchistoryItem {
+    id: i64,
+    external_id: String,
+}
+
+#[derive(Deserialize)]
+struct SchistorySale {
+    id: i64,
+    item_id: i64,
+    price: i64,
+    qlt: Option<i64>,
+    ptn: Option<i64>,
+    sold_at: String,
+    region: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchistoryImportResponse {
+    external_item_id: i64,
+    fetched_sales: usize,
+    matching_sales: usize,
+    inserted_sales: usize,
+    skipped_existing: usize,
+    oldest_sale: Option<String>,
+    newest_sale: Option<String>,
+}
+
 fn open_cache() -> Result<Connection, String> {
     let path = workspace_file(CACHE_FILE);
     let connection = Connection::open(&path).map_err(|error| format!("Не удалось открыть локальную базу: {error}"))?;
@@ -466,6 +498,23 @@ fn prepare_cache(connection: &Connection) -> Result<(), String> {
          );
          CREATE INDEX IF NOT EXISTS sale_matches_time ON lot_sale_matches(matched_timestamp DESC);"
     ).map_err(|error| format!("Не удалось подготовить локальную базу: {error}"))?;
+    ensure_column(connection, "sales", "source", "TEXT NOT NULL DEFAULT 'stalzone_api'")?;
+    ensure_column(connection, "sales", "source_id", "TEXT")?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sales_source_identity ON sales(source, source_id) WHERE source_id IS NOT NULL",
+        [],
+    ).map_err(|error| format!("Не удалось подготовить индекс источников продаж: {error}"))?;
+    Ok(())
+}
+
+fn ensure_column(connection: &Connection, table: &str, column: &str, definition: &str) -> Result<(), String> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})")).map_err(|error| error.to_string())?;
+    let columns: Vec<String> = statement.query_map([], |row| row.get(1)).map_err(|error| error.to_string())?
+        .filter_map(Result::ok).collect();
+    if !columns.iter().any(|name| name == column) {
+        connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])
+            .map_err(|error| format!("Не удалось добавить {table}.{column}: {error}"))?;
+    }
     Ok(())
 }
 
@@ -506,7 +555,7 @@ fn match_missing_lots_to_sales_in(
                 "SELECT s.fingerprint, s.sold_timestamp, s.amount, s.price, s.quality_code, s.upgrade
                  FROM sales s LEFT JOIN lot_sale_matches m ON m.sale_fingerprint = s.fingerprint
                  WHERE s.item_id = ?1 AND s.region = ?2 AND s.sold_timestamp BETWEEN ?3 AND ?4
-                   AND s.amount = ?5 AND m.sale_fingerprint IS NULL"
+                   AND s.amount = ?5 AND s.source = 'stalzone_api' AND m.sale_fingerprint IS NULL"
             ).map_err(|error| error.to_string())?;
             let rows = statement.query_map(
                 params![item_id, &region, last_seen - 60, missing_since + 120, lot_amount],
@@ -573,29 +622,177 @@ fn save_history_rows(item_id: &str, region: &str, rows: &[Value]) -> Result<usiz
     let mut inserted = 0;
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     {
+        let mut delete_external = transaction.prepare(
+            "DELETE FROM sales WHERE fingerprint = (
+               SELECT fingerprint FROM sales WHERE source = 'schistory' AND item_id = ?1 AND region = ?2
+                 AND sold_timestamp = ?3 AND amount = ?4 AND price = ?5
+                 AND quality_code IS ?6 AND upgrade IS ?7 LIMIT 1
+             )"
+        ).map_err(|error| error.to_string())?;
         let mut statement = transaction.prepare(
             "INSERT OR IGNORE INTO sales
-             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json, source, source_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'stalzone_api', NULL)"
         ).map_err(|error| error.to_string())?;
         for row in rows {
             let Some(time) = row.get("time").and_then(Value::as_str) else { continue };
             let Some(timestamp) = chrono::DateTime::parse_from_rfc3339(time).ok().map(|value| value.timestamp()) else { continue };
             let Some(row_price) = price(row, "price").filter(|value| *value > 0) else { continue };
             let raw = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            let quality_code = lot_quality_code(row);
+            let upgrade = lot_upgrade(row);
+            delete_external.execute(params![item_id, &region, timestamp, amount(row), row_price, quality_code, upgrade])
+                .map_err(|error| error.to_string())?;
             let base = format!("{:x}", Sha256::digest(format!("{region}|{item_id}|{raw}").as_bytes()));
             let occurrence = occurrences.entry(base.clone()).or_default();
             let fingerprint = if *occurrence == 0 { base } else { format!("{base}#{}", *occurrence) };
             *occurrence += 1;
             inserted += statement.execute(params![
                 fingerprint, item_id, &region, time, timestamp, amount(row), row_price,
-                lot_quality_code(row), lot_upgrade(row), raw
+                quality_code, upgrade, raw
             ]).map_err(|error| error.to_string())?;
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
     match_missing_lots_to_sales(item_id, &region)?;
     Ok(inserted)
+}
+
+#[tauri::command]
+async fn import_schistory_history(
+    item_id: String,
+    region: String,
+    quality_codes: Vec<i64>,
+    min_upgrade: Option<i64>,
+    max_upgrade: Option<i64>,
+) -> Result<SchistoryImportResponse, String> {
+    let item_id = item_id.trim().to_string();
+    let region = region.to_ascii_uppercase();
+    if item_id.is_empty() { return Err("Не выбран предмет".into()); }
+    if !matches!(region.as_str(), "RU" | "EU") { return Err("SCHistory поддерживает импорт только для RU и EU".into()); }
+    if quality_codes.is_empty() { return Err("Выберите хотя бы одну редкость для импорта".into()); }
+    if quality_codes.iter().any(|code| !(0..=5).contains(code)) { return Err("Неизвестная редкость артефакта".into()); }
+    market_filters(&[], min_upgrade, max_upgrade)?;
+
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(90)).build()
+        .map_err(|error| format!("Не удалось создать клиент SCHistory: {error}"))?;
+    let catalog = client.get(format!("{SCHISTORY_BASE}/items?type=artifact,random_item&historyNeeded=true"))
+        .header(USER_AGENT, "STALZONE-Auction-Watcher/0.1")
+        .send().await.map_err(|error| format!("SCHistory: ошибка каталога: {error}"))?;
+    if !catalog.status().is_success() { return Err(format!("SCHistory: каталог вернул HTTP {}", catalog.status())); }
+    let items: Vec<SchistoryItem> = catalog.json().await.map_err(|error| format!("SCHistory: некорректный каталог: {error}"))?;
+    let external_item_id = items.iter().find(|item| item.external_id.eq_ignore_ascii_case(&item_id))
+        .map(|item| item.id).ok_or_else(|| format!("SCHistory не содержит предмет {item_id}"))?;
+
+    let mut unique_qualities = quality_codes;
+    unique_qualities.sort_unstable();
+    unique_qualities.dedup();
+    let mut fetched_sales = 0;
+    let mut matching = Vec::new();
+    for quality in unique_qualities {
+        let url = format!("{SCHISTORY_BASE}/search/sales-history?itemId={external_item_id}&region={}&qlt={quality}", region.to_ascii_lowercase());
+        let response = client.get(url).header(USER_AGENT, "STALZONE-Auction-Watcher/0.1").send().await
+            .map_err(|error| format!("SCHistory: ошибка загрузки редкости {quality}: {error}"))?;
+        if !response.status().is_success() { return Err(format!("SCHistory: история редкости {quality} вернула HTTP {}", response.status())); }
+        let rows: Vec<SchistorySale> = response.json().await
+            .map_err(|error| format!("SCHistory: некорректная история редкости {quality}: {error}"))?;
+        fetched_sales += rows.len();
+        matching.extend(rows.into_iter().filter(|sale| {
+            sale.item_id == external_item_id
+                && sale.region.eq_ignore_ascii_case(&region)
+                && sale.qlt == Some(quality)
+                && sale.price > 0
+                && min_upgrade.is_none_or(|min| sale.ptn.is_some_and(|upgrade| upgrade >= min))
+                && max_upgrade.is_none_or(|max| sale.ptn.is_some_and(|upgrade| upgrade <= max))
+        }));
+    }
+    save_schistory_sales(&item_id, &region, external_item_id, fetched_sales, matching)
+}
+
+fn save_schistory_sales(
+    item_id: &str,
+    region: &str,
+    external_item_id: i64,
+    fetched_sales: usize,
+    rows: Vec<SchistorySale>,
+) -> Result<SchistoryImportResponse, String> {
+    let mut connection = open_cache()?;
+    save_schistory_sales_to(&mut connection, item_id, region, external_item_id, fetched_sales, rows)
+}
+
+fn save_schistory_sales_to(
+    connection: &mut Connection,
+    item_id: &str,
+    region: &str,
+    external_item_id: i64,
+    fetched_sales: usize,
+    rows: Vec<SchistorySale>,
+) -> Result<SchistoryImportResponse, String> {
+    type SaleIdentity = (i64, i64, i64, i64, i64);
+    let official_counts: HashMap<SaleIdentity, usize> = {
+        let mut statement = connection.prepare(
+            "SELECT sold_timestamp, amount, price, COALESCE(quality_code, -1), COALESCE(upgrade, -1), COUNT(*)
+             FROM sales WHERE item_id = ?1 AND region = ?2 AND source = 'stalzone_api'
+             GROUP BY sold_timestamp, amount, price, quality_code, upgrade"
+        ).map_err(|error| error.to_string())?;
+        let values = statement.query_map(params![item_id, region], |row| Ok(((
+            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?
+        ), row.get::<_, i64>(5)? as usize))).map_err(|error| error.to_string())?;
+        values.filter_map(Result::ok).collect()
+    };
+    let existing_source_ids: HashSet<String> = {
+        let mut statement = connection.prepare(
+            "SELECT source_id FROM sales WHERE source = 'schistory' AND source_id IS NOT NULL"
+        ).map_err(|error| error.to_string())?;
+        let values = statement.query_map([], |row| row.get(0)).map_err(|error| error.to_string())?;
+        values.filter_map(Result::ok).collect()
+    };
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let mut statement = transaction.prepare(
+        "INSERT OR IGNORE INTO sales
+         (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json, source, source_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, 'schistory', ?10)"
+    ).map_err(|error| error.to_string())?;
+    let mut occurrences: HashMap<SaleIdentity, usize> = HashMap::new();
+    let mut inserted_sales = 0;
+    let mut skipped_existing = 0;
+    let mut oldest_sale: Option<String> = None;
+    let mut newest_sale: Option<String> = None;
+    for sale in &rows {
+        let Some(timestamp) = chrono::DateTime::parse_from_rfc3339(&sale.sold_at).ok().map(|value| value.timestamp()) else { continue };
+        let source_id = format!("{}:{}", region.to_ascii_lowercase(), sale.id);
+        let identity = (timestamp, 1, sale.price, sale.qlt.unwrap_or(-1), sale.ptn.unwrap_or(-1));
+        let occurrence = occurrences.entry(identity).or_default();
+        let covered_by_official = *occurrence < official_counts.get(&identity).copied().unwrap_or_default();
+        *occurrence += 1;
+        if existing_source_ids.contains(&source_id) || covered_by_official {
+            skipped_existing += 1;
+            continue;
+        }
+        let raw = json!({
+            "time": sale.sold_at, "price": sale.price, "amount": 1,
+            "additional": { "qlt": sale.qlt, "ptn": sale.ptn },
+            "_source": "schistory", "_sourceId": sale.id, "_externalItemId": external_item_id
+        });
+        let fingerprint = format!("schistory:{source_id}");
+        inserted_sales += statement.execute(params![
+            fingerprint, item_id, region, &sale.sold_at, timestamp, sale.price,
+            sale.qlt, sale.ptn, raw.to_string(), source_id
+        ]).map_err(|error| error.to_string())?;
+        if oldest_sale.as_ref().is_none_or(|value| sale.sold_at.as_str() < value.as_str()) { oldest_sale = Some(sale.sold_at.clone()); }
+        if newest_sale.as_ref().is_none_or(|value| sale.sold_at.as_str() > value.as_str()) { newest_sale = Some(sale.sold_at.clone()); }
+    }
+    drop(statement);
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(SchistoryImportResponse {
+        external_item_id,
+        fetched_sales,
+        matching_sales: rows.len(),
+        inserted_sales,
+        skipped_existing,
+        oldest_sale,
+        newest_sale,
+    })
 }
 
 fn load_cached_history(item_id: &str, region: &str, days: i64, limit: usize) -> Result<Vec<Value>, String> {
@@ -1107,6 +1304,7 @@ fn history_response(total: u64, raw_rows: &[Value]) -> SalesHistoryResponse {
             time: row.get("time").and_then(Value::as_str).unwrap_or_default().into(),
             quality: quality_code.and_then(quality_label).map(str::to_string),
             quality_code, upgrade: lot_upgrade(row),
+            source: row.get("_source").and_then(Value::as_str).unwrap_or("stalzone_api").into(),
         })
     }).collect();
     SalesHistoryResponse { total, entries }
@@ -1349,6 +1547,7 @@ fn market_movement_from(
         ).unwrap_or_default();
         let official_sales = connection.query_row(
             "SELECT COUNT(*) FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3
+             AND source = 'stalzone_api'
              AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
              AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
             params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
@@ -1854,7 +2053,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { check_lock: tokio::sync::Mutex::new(()) })
-        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, market_movement, market_timing, market_analytics, check_rules, load_rules, save_rules])
+        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, import_schistory_history, market_movement, market_timing, market_analytics, check_rules, load_rules, save_rules])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }
@@ -2055,6 +2254,36 @@ mod tests {
         assert_eq!(adaptive.fair_value, adaptive.recent_median);
         assert_eq!(adaptive.latest_sale, Some(24_400_000.0));
         assert!(adaptive.trend_percent.is_some_and(|trend| trend > 10.0));
+    }
+
+    #[test]
+    fn schistory_import_is_idempotent_and_deduplicates_official_sales() {
+        let mut connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let official_time = "2026-07-02T22:33:16.000+00:00";
+        let official_timestamp = chrono::DateTime::parse_from_rfc3339(official_time).unwrap().timestamp();
+        connection.execute(
+            "INSERT INTO sales
+             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json)
+             VALUES ('official', 'qoq6', 'RU', ?1, ?2, 1, 24400000, 4, 15, '{}')",
+            params![official_time, official_timestamp]
+        ).unwrap();
+        let rows = || vec![
+            SchistorySale { id: 10, item_id: 99, price: 24_400_000, qlt: Some(4), ptn: Some(15), sold_at: official_time.into(), region: "ru".into() },
+            SchistorySale { id: 11, item_id: 99, price: 18_000_000, qlt: Some(4), ptn: Some(15), sold_at: "2025-08-01T10:00:00.000+00:00".into(), region: "ru".into() },
+        ];
+
+        let first = save_schistory_sales_to(&mut connection, "qoq6", "RU", 99, 2, rows()).expect("first import");
+        assert_eq!(first.inserted_sales, 1);
+        assert_eq!(first.skipped_existing, 1);
+        let second = save_schistory_sales_to(&mut connection, "qoq6", "RU", 99, 2, rows()).expect("second import");
+        assert_eq!(second.inserted_sales, 0);
+        assert_eq!(second.skipped_existing, 2);
+        let counts: (i64, i64) = connection.query_row(
+            "SELECT SUM(source = 'stalzone_api'), SUM(source = 'schistory') FROM sales WHERE item_id = 'qoq6'",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(counts, (1, 1));
     }
 
     #[test]

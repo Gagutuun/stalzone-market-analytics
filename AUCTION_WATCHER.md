@@ -59,6 +59,21 @@ Sales used by analytics are stored in `market_cache.sqlite3`. The file is kept
 next to the project configuration during development and next to the executable
 for a standalone build. It is local-only and excluded from Git.
 
+### SCHistory import
+
+For artifacts, the sales-history toolbar can import a selected rarity and
+upgrade range from `https://schistory.xyz`. The importer resolves the site's
+numeric item id through its public catalog `externalId`, so no manual mapping is
+required. Imported rows are tagged with source `schistory`; official STALZONE
+API rows retain source `stalzone_api`.
+
+The import is repeatable and deduplicated by SCHistory sale id. Overlapping
+recent events are matched to official rows by item, region, timestamp, amount,
+price, rarity, and upgrade, preventing the combined history from counting both
+copies. Third-party rows can extend price analytics and local charts, but they
+are excluded from official-sale counts and from matching disappeared auction
+lots to confirmed API sales.
+
 - Opening analytics synchronizes history for every active rule.
 - The first synchronization requests up to 1,000 recent sales per item and
   region; later runs continue incrementally and can extend the archive.

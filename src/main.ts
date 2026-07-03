@@ -81,8 +81,9 @@ type RuleSummary = {
 
 type CheckResult = { checkedRules: number; notifications: number; observedLots: number; collectedSales: number; collectionErrors: string[]; matches: MatchRecord[]; summaries: RuleSummary[] };
 type MarketAnalysis = { lots: number; history: number; currentMin?: number; currentMedian?: number; historyMedian?: number };
-type SalesHistoryEntry = { amount: number; price: number; unitPrice: number; time: string; quality?: string; qualityCode?: number; upgrade?: number };
+type SalesHistoryEntry = { amount: number; price: number; unitPrice: number; time: string; quality?: string; qualityCode?: number; upgrade?: number; source: string };
 type SalesHistoryResponse = { total: number; entries: SalesHistoryEntry[] };
+type SchistoryImportResponse = { externalItemId: number; fetchedSales: number; matchingSales: number; insertedSales: number; skippedExisting: number; oldestSale?: string; newestSale?: string };
 type MarketInsight = {
   name: string; itemId: string; region: string; activeLots: number; matchingLots: number;
   artifactQualities: ArtifactQuality[]; minUpgrade?: number; maxUpgrade?: number;
@@ -249,12 +250,12 @@ app.innerHTML = `
       <div id="history-view" class="workspace-view hidden">
         <section class="history-head">
           <div><span class="eyebrow">Проданные лоты</span><h2 id="history-title">Выберите предмет в каталоге</h2><small id="history-subtitle">История ещё не загружена</small></div>
-          <button id="history-load" class="primary"><i data-lucide="refresh-cw"></i> Загрузить</button>
+          <div class="history-head-actions"><button id="history-import-schistory" class="secondary" title="Импортировать выбранную редкость и заточку из schistory.xyz"><i data-lucide="database-zap"></i> Импорт SCHistory</button><button id="history-load" class="primary"><i data-lucide="refresh-cw"></i> Загрузить</button></div>
         </section>
         <section class="history-filters">
           <div class="history-mode history-source"><span>Источник</span><div class="segmented" id="history-source"><button class="active" data-value="api" title="Свежие продажи напрямую из API">API</button><button data-value="local" title="Продажи, накопленные приложением для выбранного региона">Локально</button></div></div>
           <label><span>Регион</span><select id="history-region"><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
-          <label><span>Последних продаж</span><select id="history-limit"><option>50</option><option selected>100</option><option>200</option><option data-local-only value="500">500</option><option data-local-only value="1000">1 000</option><option data-local-only value="5000">5 000</option></select></label>
+          <label><span>Последних продаж</span><select id="history-limit"><option>50</option><option selected>100</option><option>200</option><option data-local-only value="500">500</option><option data-local-only value="1000">1 000</option><option data-local-only value="5000">5 000</option><option data-local-only value="10000">10 000</option></select></label>
           <label><span>Количество в лоте, от</span><input id="history-min-amount" type="number" min="1" placeholder="Любое" /></label>
           <label><span>до</span><input id="history-max-amount" type="number" min="1" placeholder="Любое" /></label>
           <div class="history-mode"><span>Цена</span><div class="segmented" id="history-price-mode"><button class="active" data-value="total">За лот</button><button data-value="unit">За штуку</button></div></div>
@@ -275,7 +276,7 @@ app.innerHTML = `
           <div><span>Средняя</span><strong id="history-average">—</strong></div>
         </section>
         <section id="history-chart-wrap" class="history-data"><div id="history-legend" class="history-legend"></div><div id="history-chart"></div><div id="history-chart-empty" class="history-empty">Выберите предмет и загрузите продажи</div></section>
-        <section id="history-table-wrap" class="history-data hidden"><div class="history-table-scroll"><table><thead><tr><th>Время</th><th class="history-quality-column">Редкость</th><th class="history-quality-column">Заточка</th><th>Количество</th><th>За лот</th><th>За штуку</th></tr></thead><tbody id="history-table-body"></tbody></table></div></section>
+        <section id="history-table-wrap" class="history-data hidden"><div class="history-table-scroll"><table><thead><tr><th>Время</th><th class="history-quality-column">Редкость</th><th class="history-quality-column">Заточка</th><th>Источник</th><th>Количество</th><th>За лот</th><th>За штуку</th></tr></thead><tbody id="history-table-body"></tbody></table></div></section>
         <a class="chart-attribution" href="https://www.tradingview.com" target="_blank" rel="noreferrer">Charts by TradingView</a>
       </div>
 
@@ -795,8 +796,8 @@ function renderSalesHistory() {
   $("#history-table-body").innerHTML = [...entries].sort((a, b) => Date.parse(b.time) - Date.parse(a.time)).map((entry) => `<tr>
     <td>${escapeHtml(new Date(entry.time).toLocaleString("ru-RU"))}</td>
     ${artifact ? `<td><span class="table-quality quality-${entry.qualityCode ?? "none"}">${escapeHtml(entry.quality || "—")}</span></td><td>${entry.upgrade == null ? "—" : `+${entry.upgrade}`}</td>` : ""}
-    <td>${entry.amount.toLocaleString("ru-RU")}</td><td>${money(entry.price)} ₽</td><td>${money(entry.unitPrice)} ₽</td>
-  </tr>`).join("") || `<tr><td colspan="6" class="table-empty">Нет продаж по выбранным фильтрам</td></tr>`;
+    <td><span class="history-source-badge ${entry.source === "schistory" ? "external" : "official"}">${entry.source === "schistory" ? "SCHistory" : "API"}</span></td><td>${entry.amount.toLocaleString("ru-RU")}</td><td>${money(entry.price)} ₽</td><td>${money(entry.unitPrice)} ₽</td>
+  </tr>`).join("") || `<tr><td colspan="7" class="table-empty">Нет продаж по выбранным фильтрам</td></tr>`;
   renderHistoryChart(entries);
 }
 
@@ -829,6 +830,36 @@ async function loadSalesHistory() {
     await refreshCacheStatus();
   } catch (error) { toast(String(error), true); log(String(error), true); }
   finally { $("#history-load").classList.remove("busy"); }
+}
+
+async function importSchistoryHistory() {
+  if (!historyItem) { toast("Сначала выберите артефакт в каталоге", true); return; }
+  if (!itemIsArtifact(historyItem)) { toast("SCHistory импортируется только для артефактов", true); return; }
+  const qualityCodes = selectedHistoryQualityCodes();
+  if (!qualityCodes.length) { toast("Выберите хотя бы одну редкость артефакта", true); return; }
+  const minUpgrade = numberValue("history-min-upgrade");
+  const maxUpgrade = numberValue("history-max-upgrade");
+  if (minUpgrade != null && maxUpgrade != null && minUpgrade > maxUpgrade) { toast("Минимальная заточка не может быть больше максимальной", true); return; }
+  const button = $("#history-import-schistory");
+  button.classList.add("busy");
+  try {
+    const response = await invoke<SchistoryImportResponse>("import_schistory_history", {
+      itemId: historyItem.id,
+      region: $<HTMLSelectElement>("#history-region").value,
+      qualityCodes,
+      minUpgrade: minUpgrade ?? null,
+      maxUpgrade: maxUpgrade ?? null,
+    });
+    historySource = "local";
+    updateHistorySourceControls();
+    $<HTMLSelectElement>("#history-limit").value = response.matchingSales > 5000 ? "10000" : response.matchingSales > 1000 ? "5000" : "1000";
+    await loadSalesHistory();
+    const range = response.oldestSale && response.newestSale
+      ? ` · ${new Date(response.oldestSale).toLocaleDateString("ru-RU")}–${new Date(response.newestSale).toLocaleDateString("ru-RU")}` : "";
+    toast(`SCHistory: добавлено ${response.insertedSales.toLocaleString("ru-RU")} продаж`);
+    log(`SCHistory item ${response.externalItemId}: получено ${response.fetchedSales}, подходит ${response.matchingSales}, добавлено ${response.insertedSales}, уже было ${response.skippedExisting}${range}`);
+  } catch (error) { toast(String(error), true); log(String(error), true); }
+  finally { button.classList.remove("busy"); }
 }
 
 function openHistory(item: CatalogItem) {
@@ -1529,6 +1560,7 @@ $("#market-rules").addEventListener("click", (event) => {
 $("#clear-matches").addEventListener("click", () => { matches = []; renderMatches(); });
 $("#matches").addEventListener("click", (event) => { const row = (event.target as HTMLElement).closest<HTMLElement>("[data-match]"); if (!row) return; $("#details-content").textContent = matches[Number(row.dataset.match)].message; $<HTMLDialogElement>("#details-dialog").showModal(); });
 $("#history-load").addEventListener("click", () => void loadSalesHistory());
+$("#history-import-schistory").addEventListener("click", () => void importSchistoryHistory());
 $("#history-source").addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button");
   if (!button || button.dataset.value === historySource) return;
