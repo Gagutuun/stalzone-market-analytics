@@ -96,12 +96,15 @@ rules. Its assumptions are adjustable without collecting the market again:
 - minimum expected net return;
 - region and item-name filters.
 
-The expected exit price starts from the 30-day sales median and receives a
-conservative haircut for price dispersion and a negative trend. Net return is
-calculated after the configured costs. Estimated sell-through uses sales per
-day relative to the number of active lots. The confidence grade combines sales
-sample size, local collection coverage, and collection count. These values are
-market estimates, not confirmation that a specific lot will sell.
+The expected exit price starts from an adaptive fair value. With eight or more
+sales in the latest 24-hour data window it uses their median; smaller fresh
+samples are blended with the 30-day median so one exceptional sale cannot reset
+the market level. A conservative haircut then reflects recent price dispersion
+and a negative trend. The UI exposes the latest sale, recent median, adaptive
+value, long median, and sample sizes. Net return is calculated after configured
+costs. Estimated sell-through uses sales per day relative to active lots. The
+confidence grade combines sales sample size, local collection coverage, and
+collection count. These values remain estimates, not a guaranteed sale price.
 
 Each opportunity also has an `А что если?` scenario tool. It recalculates the
 investment, gross revenue, net profit, return, and break-even sale price for a

@@ -87,6 +87,8 @@ type MarketInsight = {
   name: string; itemId: string; region: string; activeLots: number; matchingLots: number;
   artifactQualities: ArtifactQuality[]; minUpgrade?: number; maxUpgrade?: number;
   salesSample: number; soldAmount: number; currentMinUnit?: number; medianUnit?: number;
+  fairValueUnit?: number; recentMedianUnit?: number; recentP25Unit?: number; recentP75Unit?: number;
+  recentSalesSample: number; latestSaleUnit?: number; latestSaleAt?: string;
   averageUnit?: number; p25Unit?: number; p75Unit?: number; discountPercent?: number;
   trendPercent?: number; volatilityPercent?: number; salesPerDay?: number;
   averageSaleIntervalMinutes?: number; opportunityScore: number; liquidity: string;
@@ -378,6 +380,7 @@ app.innerHTML = `
   <dialog id="details-dialog"><div class="dialog-head"><div><span class="eyebrow">Уведомление</span><h2>Детали лота</h2></div><button class="icon-button" data-close="details-dialog"><i data-lucide="x"></i></button></div><pre id="details-content"></pre></dialog>
   <dialog id="scenario-dialog" class="scenario-dialog"><div class="dialog-head"><div><span class="eyebrow">Сценарий сделки</span><h2>А что если?</h2></div><button class="icon-button" data-close="scenario-dialog"><i data-lucide="x"></i></button></div><div class="scenario-content">
     <header class="scenario-market"><div><strong id="scenario-name">—</strong><span id="scenario-context">—</span></div><small>Изменяйте значения — расчёт обновится сразу</small></header>
+    <section class="scenario-basis"><div><span>Последняя продажа</span><strong id="scenario-latest-sale">—</strong><small id="scenario-latest-time">—</small></div><div><span>Медиана свежих 24ч</span><strong id="scenario-recent-median">—</strong><small id="scenario-recent-sample">—</small></div><div><span>Адаптивная цена</span><strong id="scenario-fair-value">—</strong></div><div><span>Медиана 30 дней</span><strong id="scenario-long-median">—</strong></div></section>
     <section class="scenario-inputs">
       <label><span>Купить за / шт.</span><div class="money-input"><input id="scenario-buy" type="number" min="0" /><b>₽</b></div></label>
       <label><span>Продать за / шт.</span><div class="money-input"><input id="scenario-sell" type="number" min="0" /><b>₽</b></div></label>
@@ -907,14 +910,14 @@ function recommendationFor(insight: MarketInsight): MarketRecommendation {
     risk: ["Рискованно", "Данных или ликвидности недостаточно для надёжного решения."],
   };
   const reasons = [
-    insight.currentMinUnit != null && insight.medianUnit != null
-      ? `Минимум ${money(insight.currentMinUnit)} ₽/шт., справедливая цена ${money(insight.medianUnit)} ₽/шт., отклонение ${signedPercent(discount)}.`
+    insight.currentMinUnit != null && (insight.fairValueUnit ?? insight.medianUnit) != null
+      ? `Минимум ${money(insight.currentMinUnit)} ₽/шт., адаптивная цена ${money(insight.fairValueUnit ?? insight.medianUnit)} ₽/шт., отклонение ${signedPercent(discount)}.`
       : "Недостаточно данных для сравнения с медианой.",
     `Тренд ${signedPercent(insight.trendPercent)}, ликвидность ${insight.liquidity.toLocaleLowerCase("ru")}, разброс ${signedPercent(insight.volatilityPercent)}.`,
   ];
   if (supplyChange != null) reasons.push(`Предложение за 24 часа ${signedPercent(supplyChange)}, медианная цена ${signedPercent(priceMovement)}; официальных продаж ${movement?.officialSales ?? 0}.`);
   if (insight.risks.length) reasons.push(`Риски: ${insight.risks.join(", ").toLocaleLowerCase("ru")}.`);
-  const fair = insight.medianUnit;
+  const fair = insight.fairValueUnit ?? insight.medianUnit;
   const targetLow = fair == null ? undefined : roundRecommendationPrice(Math.max(fair * .75, Math.min(insight.p25Unit ?? fair * .85, fair * .85)));
   const targetHigh = fair == null ? undefined : roundRecommendationPrice(fair * .9);
   const confidence = insight.salesSample >= 100 && (movement?.collections ?? 0) >= 5 && volatility < 30
@@ -981,10 +984,10 @@ function renderAnalytics() {
       <div class="insight-heading"><span class="rule-region">${escapeHtml(item.region)}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.itemId)} · ${item.salesSample} продаж в расчёте</small></div></div>
       <div class="score-box ${scoreClass}"><strong>${item.opportunityScore}</strong><span>${escapeHtml(item.verdict)}</span></div>
       <div class="insight-actions"><button class="icon-button small insight-history" title="Открыть историю продаж"><i data-lucide="history"></i></button><button class="icon-button small insight-edit" title="Изменить правило"><i data-lucide="pencil"></i></button></div>
-      <div class="insight-signal"><div><span>Текущий минимум</span><strong>${money(item.currentMinUnit)} ₽/шт.</strong></div><div><span>Справедливая цена</span><strong>${money(item.medianUnit)} ₽/шт.</strong></div><div><span>Скидка к медиане</span><strong class="${discountClass}">${signedPercent(item.discountPercent)}</strong></div></div>
+      <div class="insight-signal"><div><span>Текущий минимум</span><strong>${money(item.currentMinUnit)} ₽/шт.</strong></div><div><span>Адаптивная цена</span><strong>${money(item.fairValueUnit ?? item.medianUnit)} ₽/шт.</strong></div><div><span>Отклонение</span><strong class="${discountClass}">${signedPercent(item.discountPercent)}</strong></div></div>
       <div class="opportunity-track"><span class="${scoreClass}" style="width:${item.opportunityScore}%"></span></div>
-      <div class="price-zones"><div><span>Зона покупки · P25</span><strong>${money(item.p25Unit)} ₽</strong></div><div><span>Медиана</span><strong>${money(item.medianUnit)} ₽</strong></div><div><span>Дорогая зона · P75</span><strong>${money(item.p75Unit)} ₽</strong></div></div>
-      <div class="insight-metrics"><div><span>Тренд</span><strong class="${trendClass}">${signedPercent(item.trendPercent)}</strong></div><div><span>Разброс цены</span><strong>${signedPercent(item.volatilityPercent)}</strong></div><div><span>Продаж в день</span><strong>${item.salesPerDay == null ? "—" : item.salesPerDay.toFixed(1)}</strong></div><div><span>Интервал продажи</span><strong>${formatInterval(item.averageSaleIntervalMinutes)}</strong></div><div><span>Ликвидность</span><strong>${escapeHtml(item.liquidity)}</strong></div><div><span>Активных / подходит</span><strong>${item.activeLots} / ${item.matchingLots}</strong></div></div>
+      <div class="price-zones"><div><span>Недавний P25</span><strong>${money(item.recentP25Unit ?? item.p25Unit)} ₽</strong></div><div><span>Адаптивная / 30 дней</span><strong>${money(item.fairValueUnit ?? item.medianUnit)} / ${money(item.medianUnit)} ₽</strong></div><div><span>Недавний P75</span><strong>${money(item.recentP75Unit ?? item.p75Unit)} ₽</strong></div></div>
+      <div class="insight-metrics"><div><span>Тренд 24ч</span><strong class="${trendClass}">${signedPercent(item.trendPercent)}</strong></div><div><span>Недавний разброс</span><strong>${signedPercent(item.volatilityPercent)}</strong></div><div><span>Продаж в день</span><strong>${item.salesPerDay == null ? "—" : item.salesPerDay.toFixed(1)}</strong></div><div><span>Свежая выборка</span><strong>${item.recentSalesSample}</strong></div><div><span>Ликвидность</span><strong>${escapeHtml(item.liquidity)}</strong></div><div><span>Активных / подходит</span><strong>${item.activeLots} / ${item.matchingLots}</strong></div></div>
       <div class="risk-row">${item.risks.length ? item.risks.map((risk) => `<span><i data-lucide="shield-alert"></i>${escapeHtml(risk)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Явных рисков нет</span>`}</div>
     </article>`;
   }).join("") || `<div class="analytics-empty"><i data-lucide="sparkles"></i><strong>${analyticsInsights.length ? "Нет сигналов по выбранным фильтрам" : "Рассчитайте рыночные сигналы"}</strong><span>${rules.length ? "Расчёт использует активные правила" : "Сначала добавьте хотя бы одно правило"}</span></div>`;
@@ -1012,12 +1015,13 @@ async function loadAnalytics() {
 }
 
 function opportunityFor(insight: MarketInsight, feePercent: number, horizonDays: number): MarketOpportunity | undefined {
-  if (insight.currentMinUnit == null || insight.medianUnit == null || insight.currentMinUnit <= 0 || insight.medianUnit <= 0) return undefined;
+  const fairValue = insight.fairValueUnit ?? insight.medianUnit;
+  if (insight.currentMinUnit == null || fairValue == null || insight.currentMinUnit <= 0 || fairValue <= 0) return undefined;
   const movement = scannerMovements.find((item) => item.itemId === insight.itemId && item.region === insight.region);
   const volatility = Math.max(0, insight.volatilityPercent ?? 35);
   const negativeTrend = Math.max(0, -(insight.trendPercent ?? 0));
   const haircutPercent = Math.min(12, Math.max(2, volatility * .15) + Math.min(5, negativeTrend * .25));
-  const expectedSellPrice = insight.medianUnit * (1 - haircutPercent / 100);
+  const expectedSellPrice = fairValue * (1 - haircutPercent / 100);
   const netSellPrice = expectedSellPrice * (1 - feePercent / 100);
   const profitPerUnit = netSellPrice - insight.currentMinUnit;
   const roiPercent = profitPerUnit / insight.currentMinUnit * 100;
@@ -1041,6 +1045,7 @@ function opportunityFor(insight: MarketInsight, feePercent: number, horizonDays:
   if (haircutPercent >= 8) warnings.push("Цена выхода снижена из-за риска");
   if (sellThroughPercent < 35) warnings.push(`Вероятно долгая продажа: более ${horizonDays} дн.`);
   if ((movement?.supplyChangePercent ?? 0) >= 20) warnings.push("Предложение быстро растёт");
+  if (insight.medianUnit != null && Math.abs(fairValue / insight.medianUnit - 1) >= .1) warnings.push("Рынок сменил ценовой уровень");
   if (profitPerUnit <= 0) warnings.push("После расходов ожидается убыток");
   return { insight, score, buyPrice: insight.currentMinUnit, expectedSellPrice, netSellPrice, profitPerUnit, roiPercent, sellThroughPercent, confidencePercent, confidence, warnings: [...new Set(warnings)] };
 }
@@ -1082,7 +1087,7 @@ function renderScanner() {
     const variant = insightVariantLabel(item.insight);
     return `<article class="opportunity-card ${scoreClass}" data-opportunity-index="${insightIndex}" data-opportunity-id="${escapeHtml(item.insight.itemId)}" data-opportunity-region="${escapeHtml(item.insight.region)}" data-target-buy="${targetBuy}">
       <header><span class="opportunity-rank">${index + 1}</span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)} · ${item.insight.salesSample} продаж${variant ? ` · ${escapeHtml(variant)}` : ""}</small></div><div class="opportunity-score ${scoreClass}"><strong>${item.score}</strong><span>из 100</span></div></header>
-      <div class="opportunity-prices"><div><span>Купить сейчас</span><strong>${money(item.buyPrice)} ₽</strong></div><i data-lucide="chevron-right"></i><div><span>Ожидаемая продажа</span><strong>${money(item.expectedSellPrice)} ₽</strong><small>консервативнее медианы ${money(item.insight.medianUnit)} ₽</small></div><i data-lucide="chevron-right"></i><div><span>После расходов</span><strong>${money(item.netSellPrice)} ₽</strong></div></div>
+      <div class="opportunity-prices"><div><span>Купить сейчас</span><strong>${money(item.buyPrice)} ₽</strong></div><i data-lucide="chevron-right"></i><div><span>Ожидаемая продажа</span><strong>${money(item.expectedSellPrice)} ₽</strong><small>адаптивная ${money(item.insight.fairValueUnit ?? item.insight.medianUnit)} ₽ · последняя ${money(item.insight.latestSaleUnit)} ₽</small></div><i data-lucide="chevron-right"></i><div><span>После расходов</span><strong>${money(item.netSellPrice)} ₽</strong></div></div>
       <div class="opportunity-result"><div><span>Чистая прибыль / шт.</span><strong class="${roiClass}">${item.profitPerUnit >= 0 ? "+" : ""}${money(item.profitPerUnit)} ₽</strong></div><div><span>Доходность</span><strong class="${roiClass}">${signedPercent(item.roiPercent)}</strong></div><div><span>Реализация за ${horizon} дн.</span><strong>${item.sellThroughPercent.toFixed(0)}%</strong><small>оценка по обороту</small></div><div><span>Уверенность</span><strong>${item.confidence}</strong><small>${item.confidencePercent.toFixed(0)}% качества данных</small></div></div>
       <footer><div class="opportunity-warnings">${item.warnings.length ? item.warnings.slice(0, 3).map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Критичных рисков не найдено</span>`}</div><div class="opportunity-actions"><button class="secondary scenario-open"><i data-lucide="gauge"></i> А что если?</button><button class="secondary scanner-rule"><i data-lucide="plus"></i> Правило ≤ ${money(targetBuy)} ₽</button></div></footer>
     </article>`;
@@ -1108,13 +1113,13 @@ function renderScenarioCalculation() {
   $("#scenario-profit").className = profit >= 0 ? "positive" : "negative";
   $("#scenario-roi").textContent = signedPercent(roi);
   $("#scenario-roi").className = (roi ?? 0) >= 0 ? "positive" : "negative";
-  const fair = scenarioOpportunity.insight.medianUnit;
+  const fair = scenarioOpportunity.insight.fairValueUnit ?? scenarioOpportunity.insight.medianUnit;
   const fairDelta = fair && sell > 0 ? (sell - fair) / fair * 100 : undefined;
   $("#scenario-verdict").textContent = buy <= 0 || sell <= 0 ? "Введите цены покупки и продажи"
     : profit > 0 ? `Сценарий даёт ${money(profit)} ₽ после расходов`
     : profit === 0 ? "Сценарий выходит в ноль" : `Сценарий теряет ${money(Math.abs(profit))} ₽`;
   $("#scenario-break-even").textContent = breakEven == null ? "Точка безубыточности недоступна"
-    : `Безубыточная продажа: ${money(breakEven)} ₽/шт.${fairDelta == null ? "" : ` · ваша цена ${signedPercent(fairDelta)} к медиане`}`;
+    : `Безубыточная продажа: ${money(breakEven)} ₽/шт.${fairDelta == null ? "" : ` · ваша цена ${signedPercent(fairDelta)} к адаптивной цене`}`;
 }
 
 function renderMarketTiming(timing: MarketTimingResponse) {
@@ -1136,6 +1141,12 @@ async function openScenario(opportunity: MarketOpportunity) {
   const insight = opportunity.insight;
   $("#scenario-name").textContent = insight.name;
   $("#scenario-context").textContent = `${insight.region} · ${insight.itemId}${insightVariantLabel(insight) ? ` · ${insightVariantLabel(insight)}` : ""}`;
+  $("#scenario-latest-sale").textContent = `${money(insight.latestSaleUnit)} ₽`;
+  $("#scenario-latest-time").textContent = insight.latestSaleAt ? new Date(insight.latestSaleAt).toLocaleString("ru-RU") : "нет времени продажи";
+  $("#scenario-recent-median").textContent = `${money(insight.recentMedianUnit)} ₽`;
+  $("#scenario-recent-sample").textContent = `${insight.recentSalesSample} продаж`;
+  $("#scenario-fair-value").textContent = `${money(insight.fairValueUnit ?? insight.medianUnit)} ₽`;
+  $("#scenario-long-median").textContent = `${money(insight.medianUnit)} ₽`;
   input("scenario-buy").value = String(Math.round(opportunity.buyPrice));
   input("scenario-sell").value = String(Math.round(opportunity.expectedSellPrice));
   input("scenario-amount").value = "1";

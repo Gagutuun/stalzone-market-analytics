@@ -132,6 +132,13 @@ struct MarketInsight {
     sold_amount: i64,
     current_min_unit: Option<f64>,
     median_unit: Option<f64>,
+    fair_value_unit: Option<f64>,
+    recent_median_unit: Option<f64>,
+    recent_p25_unit: Option<f64>,
+    recent_p75_unit: Option<f64>,
+    recent_sales_sample: usize,
+    latest_sale_unit: Option<f64>,
+    latest_sale_at: Option<String>,
     average_unit: Option<f64>,
     p25_unit: Option<f64>,
     p75_unit: Option<f64>,
@@ -891,6 +898,59 @@ fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     Some(sorted[lower] * (1.0 - weight) + sorted[upper] * weight)
 }
 
+#[derive(Default)]
+struct AdaptiveMarketPrice {
+    fair_value: Option<f64>,
+    recent_median: Option<f64>,
+    recent_p25: Option<f64>,
+    recent_p75: Option<f64>,
+    recent_sample: usize,
+    latest_sale: Option<f64>,
+    latest_sale_at: Option<String>,
+    trend_percent: Option<f64>,
+    volatility_percent: Option<f64>,
+}
+
+fn adaptive_market_price(timed_prices: &[(i64, f64)], history_median: Option<f64>) -> AdaptiveMarketPrice {
+    let Some((latest_timestamp, latest_price)) = timed_prices.first().copied() else { return AdaptiveMarketPrice::default() };
+    let recent: Vec<f64> = timed_prices.iter()
+        .take_while(|(timestamp, _)| latest_timestamp - *timestamp <= 86_400)
+        .map(|(_, price)| *price).collect();
+    let previous: Vec<f64> = timed_prices.iter()
+        .filter(|(timestamp, _)| latest_timestamp - *timestamp > 86_400 && latest_timestamp - *timestamp <= 172_800)
+        .map(|(_, price)| *price).collect();
+    let recent_median = median(&recent);
+    let recency_weight = match recent.len() { 8.. => 1.0, 5..=7 => 0.85, 3..=4 => 0.65, 1..=2 => 0.35, _ => 0.0 };
+    let fair_value = recent_median.zip(history_median)
+        .map(|(recent_value, history_value)| recent_value * recency_weight + history_value * (1.0 - recency_weight))
+        .or(recent_median).or(history_median);
+    let recent_p25 = percentile(&recent, 0.25);
+    let recent_p75 = percentile(&recent, 0.75);
+    let volatility_percent = recent_p25.zip(recent_p75).zip(recent_median)
+        .and_then(|((low, high), center)| (center > 0.0).then_some((high - low) / center * 100.0));
+    let trend_percent = if recent.len() >= 3 && previous.len() >= 3 {
+        recent_median.zip(median(&previous))
+            .and_then(|(current, prior)| (prior > 0.0).then_some((current - prior) / prior * 100.0))
+    } else {
+        let middle = timed_prices.len() / 2;
+        let newest: Vec<f64> = timed_prices.iter().take(middle.max(1)).map(|(_, price)| *price).collect();
+        let older: Vec<f64> = timed_prices.iter().skip(middle.max(1)).map(|(_, price)| *price).collect();
+        median(&newest).zip(median(&older))
+            .and_then(|(current, prior)| (prior > 0.0).then_some((current - prior) / prior * 100.0))
+    };
+    AdaptiveMarketPrice {
+        fair_value,
+        recent_median,
+        recent_p25,
+        recent_p75,
+        recent_sample: recent.len(),
+        latest_sale: Some(latest_price),
+        latest_sale_at: chrono::DateTime::from_timestamp(latest_timestamp, 0).map(|value| value.to_rfc3339()),
+        trend_percent,
+        volatility_percent,
+    }
+}
+
 fn save_market_snapshot(rule: &WatchRule, lots: &[Value], matching_lots: usize) -> Result<(), String> {
     let connection = open_cache()?;
     save_market_snapshot_to(&connection, rule, lots, matching_lots, chrono::Utc::now())
@@ -1432,10 +1492,6 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
         let average = (!history_units.is_empty()).then(|| history_units.iter().sum::<f64>() / history_units.len() as f64);
         let p25 = percentile(&history_units, 0.25);
         let p75 = percentile(&history_units, 0.75);
-        let discount = current_min.zip(history_median).and_then(|(current, market)|
-            (market > 0.0).then_some((market - current) / market * 100.0));
-        let volatility = p25.zip(p75).zip(history_median).and_then(|((low, high), market)|
-            (market > 0.0).then_some((high - low) / market * 100.0));
 
         let mut timed_prices: Vec<(i64, f64)> = comparable_history.iter().filter_map(|row| {
             let time = row.get("time").and_then(Value::as_str)?;
@@ -1443,11 +1499,13 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
             Some((timestamp, unit_price(row, "price")?))
         }).collect();
         timed_prices.sort_by(|a, b| b.0.cmp(&a.0));
-        let middle = timed_prices.len() / 2;
-        let newest: Vec<f64> = timed_prices.iter().take(middle.max(1)).map(|(_, price)| *price).collect();
-        let older: Vec<f64> = timed_prices.iter().skip(middle.max(1)).map(|(_, price)| *price).collect();
-        let trend = median(&newest).zip(median(&older)).and_then(|(recent, previous)|
-            (previous > 0.0).then_some((recent - previous) / previous * 100.0));
+        let adaptive = adaptive_market_price(&timed_prices, history_median);
+        let discount = current_min.zip(adaptive.fair_value).and_then(|(current, market)|
+            (market > 0.0).then_some((market - current) / market * 100.0));
+        let broad_volatility = p25.zip(p75).zip(history_median).and_then(|((low, high), market)|
+            (market > 0.0).then_some((high - low) / market * 100.0));
+        let volatility = adaptive.volatility_percent.or(broad_volatility);
+        let trend = adaptive.trend_percent;
         let span_seconds = timed_prices.first().zip(timed_prices.last()).map(|(newest, oldest)| (newest.0 - oldest.0).abs() as f64);
         let average_interval = span_seconds.and_then(|span|
             (timed_prices.len() > 1).then_some(span / (timed_prices.len() - 1) as f64 / 60.0));
@@ -1469,7 +1527,7 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
         if history_units.len() < 30 { risks.push("Мало данных".into()); }
         if volatility.is_some_and(|value| value > 35.0) { risks.push("Высокий разброс цены".into()); }
         if liquidity == "Низкая" { risks.push("Медленные продажи".into()); }
-        if discount.is_some_and(|value| value < 0.0) { risks.push("Минимум выше медианы".into()); }
+        if discount.is_some_and(|value| value < 0.0) { risks.push("Минимум выше адаптивной цены".into()); }
         if comparable_lots.len() <= 2 { risks.push("Мало активных предложений".into()); }
 
         let matching_lots = comparable_lots.iter().filter(|lot| lot_matches(&rule, lot, &current_units, history_median)).count();
@@ -1479,7 +1537,11 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
             artifact_qualities: rule.artifact_qualities, min_upgrade: rule.min_upgrade, max_upgrade: rule.max_upgrade,
             active_lots: comparable_lots.len(), matching_lots, sales_sample: history_units.len(),
             sold_amount: comparable_history.iter().map(|row| amount(row)).sum(),
-            current_min_unit: current_min, median_unit: history_median, average_unit: average,
+            current_min_unit: current_min, median_unit: history_median, fair_value_unit: adaptive.fair_value,
+            recent_median_unit: adaptive.recent_median, recent_p25_unit: adaptive.recent_p25,
+            recent_p75_unit: adaptive.recent_p75, recent_sales_sample: adaptive.recent_sample,
+            latest_sale_unit: adaptive.latest_sale, latest_sale_at: adaptive.latest_sale_at,
+            average_unit: average,
             p25_unit: p25, p75_unit: p75, discount_percent: discount, trend_percent: trend,
             volatility_percent: volatility, sales_per_day, average_sale_interval_minutes: average_interval,
             opportunity_score: score, liquidity, verdict, risks,
@@ -1976,6 +2038,23 @@ mod tests {
         assert_eq!(timing.hour_windows[0].median_min_unit, 80.0);
         assert_eq!(timing.weekdays[0].key, 3);
         assert_eq!(timing.weekdays[0].median_min_unit, 90.0);
+    }
+
+    #[test]
+    fn adaptive_price_follows_confirmed_recent_market_level() {
+        let latest = chrono::DateTime::parse_from_rfc3339("2026-07-02T22:33:16Z").unwrap().timestamp();
+        let recent_prices = [24_400_000.0, 24_333_333.0, 24_000_000.0, 25_000_000.0, 24_444_424.0, 24_000_000.0, 23_500_000.0, 23_000_000.0];
+        let mut timed: Vec<(i64, f64)> = recent_prices.into_iter().enumerate()
+            .map(|(index, price)| (latest - index as i64 * 8_000, price)).collect();
+        timed.extend([(latest - 100_000, 22_000_000.0), (latest - 120_000, 21_500_000.0), (latest - 140_000, 21_000_000.0)]);
+        timed.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let adaptive = adaptive_market_price(&timed, Some(20_850_000.0));
+        assert_eq!(adaptive.recent_sample, 8);
+        assert_eq!(adaptive.recent_median, Some(24_166_666.5));
+        assert_eq!(adaptive.fair_value, adaptive.recent_median);
+        assert_eq!(adaptive.latest_sale, Some(24_400_000.0));
+        assert!(adaptive.trend_percent.is_some_and(|trend| trend > 10.0));
     }
 
     #[test]
