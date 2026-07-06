@@ -8,17 +8,26 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-const API_BASE: &str = "https://eapi.stalzone.com";
+const API_BASE: &str = "https://eapi.stalcraft.net";
 const ITEMS_BASE: &str = "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main";
 const CONFIG_FILE: &str = "auction_watchlist.json";
 const STATE_FILE: &str = ".auction_seen.json";
+const RAPID_STATE_FILE: &str = ".auction_rapid_seen.json";
 const CACHE_FILE: &str = "market_cache.sqlite3";
 const SCHISTORY_BASE: &str = "https://schistory.xyz/api";
+const ANALYTICS_HISTORY_DAYS: i64 = 400;
+const ANALYTICS_HISTORY_LIMIT: usize = 100_000;
+const RAPID_HISTORY_DAYS: i64 = 30;
+const RAPID_HISTORY_LIMIT: usize = 5_000;
+const RAPID_MEDIAN_TTL_SECONDS: i64 = 300;
 
 struct AppState {
     check_lock: tokio::sync::Mutex<()>,
+    rapid_lock: tokio::sync::Mutex<()>,
+    rapid_medians: tokio::sync::Mutex<HashMap<String, (i64, Option<f64>)>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +48,8 @@ pub struct WatchRule {
     pub history_limit: usize,
     #[serde(default)]
     pub min_amount: Option<i64>,
+    #[serde(default)]
+    pub max_amount: Option<i64>,
     #[serde(default)]
     pub artifact_qualities: Vec<String>,
     #[serde(default)]
@@ -61,6 +72,12 @@ pub struct WatchRule {
     pub group_id: Option<String>,
     #[serde(default)]
     pub group_top_n: Option<usize>,
+    #[serde(default)]
+    pub rapid_monitor: bool,
+    #[serde(default = "default_rapid_interval")]
+    pub rapid_interval_seconds: u64,
+    #[serde(default = "default_rapid_limit")]
+    pub rapid_limit: usize,
 }
 
 fn default_history_limit() -> usize { 100 }
@@ -68,6 +85,8 @@ fn default_limit() -> usize { 50 }
 fn default_true() -> bool { true }
 fn default_sort() -> String { "time_created".into() }
 fn default_order() -> String { "desc".into() }
+fn default_rapid_interval() -> u64 { 5 }
+fn default_rapid_limit() -> usize { 5 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,10 +145,19 @@ struct MarketInsight {
     item_id: String,
     region: String,
     artifact_qualities: Vec<String>,
+    min_amount: Option<i64>,
     min_upgrade: Option<i64>,
     max_upgrade: Option<i64>,
     active_lots: usize,
+    all_active_lots: usize,
     matching_lots: usize,
+    current_min_amount: Option<i64>,
+    comparison_amount_label: String,
+    comparison_amount_min: i64,
+    comparison_amount_max: Option<i64>,
+    stackability: String,
+    stack_evidence: usize,
+    max_observed_amount: i64,
     sales_sample: usize,
     sold_amount: i64,
     current_min_unit: Option<f64>,
@@ -149,6 +177,10 @@ struct MarketInsight {
     volatility_percent: Option<f64>,
     sales_per_day: Option<f64>,
     average_sale_interval_minutes: Option<f64>,
+    movement_supply_change_percent: Option<f64>,
+    movement_price_change_percent: Option<f64>,
+    movement_collections: u64,
+    movement_coverage_percent: f64,
     opportunity_score: u8,
     liquidity: String,
     verdict: String,
@@ -160,6 +192,190 @@ struct MarketInsight {
 struct MarketAnalyticsResponse {
     generated_at: String,
     insights: Vec<MarketInsight>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiMarketAnalysis {
+    action: String,
+    main_scenario: String,
+    summary: String,
+    #[serde(default)]
+    arguments_for: Vec<String>,
+    #[serde(default)]
+    arguments_against: Vec<String>,
+    #[serde(default)]
+    entry_conditions: Vec<String>,
+    #[serde(default)]
+    cancellation_conditions: Vec<String>,
+    #[serde(default)]
+    missing_data: Vec<String>,
+}
+
+fn ai_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(endpoint.trim())
+        .map_err(|error| format!("Некорректный адрес модели: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Адрес модели должен использовать протокол HTTP или HTTPS".into());
+    }
+    if url.host_str().is_none() {
+        return Err("В адресе модели не указан сервер".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Не указывайте логин или ключ в адресе; используйте отдельное поле API key".into());
+    }
+    Ok(url)
+}
+
+fn normalized_ai_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
+    let mut url = ai_endpoint(endpoint)?;
+    if url.path().trim_end_matches('/') == "/api/v1/chat" {
+        url.set_path("/v1/chat/completions");
+        url.set_query(None);
+    }
+    Ok(url)
+}
+
+fn remove_trailing_json_commas(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut result = String::with_capacity(source.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if in_string {
+            result.push(current);
+            if escaped {
+                escaped = false;
+            } else if current == '\\' {
+                escaped = true;
+            } else if current == '"' {
+                in_string = false;
+            }
+        } else if current == '"' {
+            in_string = true;
+            result.push(current);
+        } else if current == ',' {
+            let mut next = index + 1;
+            while next < chars.len() && chars[next].is_whitespace() {
+                next += 1;
+            }
+            if next >= chars.len() || !matches!(chars[next], ']' | '}') {
+                result.push(current);
+            }
+        } else {
+            result.push(current);
+        }
+        index += 1;
+    }
+    result
+}
+
+fn parse_ai_market_analysis(content: &str) -> Result<AiMarketAnalysis, String> {
+    let trimmed = content.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .strip_prefix("```json").or_else(|| trimmed.strip_prefix("```"))
+            .and_then(|value| value.strip_suffix("```"))
+            .unwrap_or(trimmed)
+            .trim()
+    } else {
+        trimmed
+    };
+    let mut analysis: AiMarketAnalysis = serde_json::from_str(json_text).or_else(|_| {
+        serde_json::from_str(&remove_trailing_json_commas(json_text))
+    }).map_err(|error| format!("Модель вернула ответ не в ожидаемом JSON-формате: {error}"))?;
+    analysis.action = analysis.action.trim().chars().take(80).collect();
+    analysis.main_scenario = analysis.main_scenario.trim().chars().take(500).collect();
+    analysis.summary = analysis.summary.trim().chars().take(800).collect();
+    for list in [
+        &mut analysis.arguments_for,
+        &mut analysis.arguments_against,
+        &mut analysis.entry_conditions,
+        &mut analysis.cancellation_conditions,
+        &mut analysis.missing_data,
+    ] {
+        list.truncate(6);
+        for value in list.iter_mut() {
+            *value = value.trim().chars().take(350).collect();
+        }
+        list.retain(|value| !value.is_empty());
+    }
+    if analysis.action.is_empty() || analysis.summary.is_empty() {
+        return Err("Модель не указала обязательные поля action и summary".into());
+    }
+    Ok(analysis)
+}
+
+#[tauri::command]
+async fn ai_market_analysis(endpoint: String, model: String, api_key: Option<String>, context: Value) -> Result<AiMarketAnalysis, String> {
+    let url = normalized_ai_endpoint(&endpoint)?;
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("Укажите имя модели".into());
+    }
+    let system = r#"Ты независимый аудитор внутриигрового рынка STALCRAFT. Тебе намеренно не показан вывод основной аналитики приложения.
+Не угадывай его и не пытайся соглашаться с ним. Сформируй собственный вывод только по наблюдаемым фактам из JSON пользователя.
+Не пересчитывай и не выдумывай отсутствующие показатели.
+Отделяй качество данных от вероятности успешной сделки. Если фактов недостаточно, прямо укажи это.
+Учитывай комиссию, ликвидность, тренд, волатильность, глубину предложения и возможность складывания предмета.
+collectionCoveragePercent означает полноту обходов, а не ликвидность. Ликвидность оценивай по подтверждённым продажам и их частоте.
+Для single и unknown запрещено советовать сборку или продажу пачкой.
+Поле action начни с одного из решений: Покупать сейчас, Ждать, Продавать, Держать или Недостаточно данных.
+Ответь только JSON-объектом с полями: action, mainScenario, summary, argumentsFor, argumentsAgainst,
+entryConditions, cancellationConditions, missingData. Все значения на русском. Массивы содержат короткие строки."#;
+    let user = serde_json::to_string(&context).map_err(|error| error.to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())?;
+    let ollama = url.path().trim_end_matches('/').ends_with("/api/chat");
+    let payload = if ollama {
+        json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "options": { "temperature": 0.15 },
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ]
+        })
+    } else {
+        json!({
+            "model": model,
+            "temperature": 0.15,
+            "response_format": { "type": "text" },
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ]
+        })
+    };
+    let mut request = client.post(url).json(&payload);
+    if let Some(key) = api_key.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await
+        .map_err(|error| format!("Сервер модели недоступен: {error}"))?;
+    let status = response.status();
+    let body: Value = response.json().await
+        .map_err(|error| format!("Не удалось прочитать ответ локальной модели: {error}"))?;
+    if !status.is_success() {
+        let message = body.get("error")
+            .and_then(|value| value.as_str())
+            .or_else(|| body.pointer("/error/message").and_then(|value| value.as_str()))
+            .unwrap_or("неизвестная ошибка");
+        return Err(format!("Сервер модели вернул HTTP {status}: {message}"));
+    }
+    let content = if ollama {
+        body.pointer("/message/content").and_then(|value| value.as_str())
+    } else {
+        body.pointer("/choices/0/message/content").and_then(|value| value.as_str())
+    }.ok_or_else(|| "В ответе локальной модели нет текста анализа".to_string())?;
+    parse_ai_market_analysis(content)
 }
 
 #[derive(Serialize)]
@@ -183,11 +399,95 @@ struct MarketTimingResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DeepPriceWindow {
+    hours: i64,
+    sales: usize,
+    units: i64,
+    p25_unit: Option<f64>,
+    median_unit: Option<f64>,
+    p75_unit: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeepStackSegment {
+    label: String,
+    sales: usize,
+    units: i64,
+    median_unit: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketDepthLevel {
+    price: f64,
+    lots: usize,
+    units: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketDeepAnalysis {
+    generated_at: String,
+    history_hours: f64,
+    total_sales: usize,
+    sold_units: i64,
+    collections: u64,
+    complete_collections: u64,
+    current_supply: usize,
+    current_units: i64,
+    current_min_unit: Option<f64>,
+    current_median_unit: Option<f64>,
+    supply_change_percent: Option<f64>,
+    expected_sell_unit: Option<f64>,
+    buy_for_five_percent: Option<f64>,
+    buy_for_ten_percent: Option<f64>,
+    windows: Vec<DeepPriceWindow>,
+    stack_segments: Vec<DeepStackSegment>,
+    depth: Vec<MarketDepthLevel>,
+    insights: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StackStrategyAnalysis {
+    buy_max_amount: i64,
+    sell_min_amount: i64,
+    target_amount: i64,
+    acquired_amount: i64,
+    purchase_lots: usize,
+    available_lots: usize,
+    available_units: i64,
+    total_cost: i64,
+    average_buy_unit: Option<f64>,
+    cheapest_buy_unit: Option<f64>,
+    expected_sell_unit: Option<f64>,
+    recent_bulk_median_unit: Option<f64>,
+    bulk_sales_sample: usize,
+    net_revenue: Option<f64>,
+    profit: Option<f64>,
+    roi_percent: Option<f64>,
+    break_even_buy_unit: Option<f64>,
+    complete: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MovementPoint {
     time: i64,
     supply: i64,
     min_unit: Option<f64>,
     median_unit: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MovementSalePoint {
+    time: i64,
+    median_unit: f64,
+    sales: usize,
+    units: i64,
 }
 
 #[derive(Serialize)]
@@ -209,11 +509,14 @@ struct MovementFilters {
     quality_mask: i64,
     min_upgrade: Option<i64>,
     max_upgrade: Option<i64>,
+    min_amount: Option<i64>,
+    max_amount: Option<i64>,
 }
 
 impl MovementFilters {
     fn active(self) -> bool {
         self.quality_mask != 0 || self.min_upgrade.is_some() || self.max_upgrade.is_some()
+            || self.min_amount.is_some() || self.max_amount.is_some()
     }
 }
 
@@ -229,7 +532,9 @@ struct MarketMovement {
     price_change_percent: Option<f64>,
     appeared: u64,
     disappeared: u64,
-    official_sales: u64,
+    recorded_sales: u64,
+    schistory_sales: u64,
+    stalzone_sales: u64,
     probable_sales: u64,
     unexplained_missing: u64,
     ended: u64,
@@ -240,6 +545,7 @@ struct MarketMovement {
     last_collected: String,
     signal: String,
     points: Vec<MovementPoint>,
+    sale_points: Vec<MovementSalePoint>,
     events: Vec<MovementEvent>,
 }
 
@@ -288,6 +594,36 @@ struct CheckResult {
     summaries: Vec<RuleSummary>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RapidSeenState {
+    markets: HashMap<String, Vec<String>>,
+    updated_at: Option<String>,
+}
+
+#[derive(Default)]
+struct RateLimitState {
+    limit: Option<u64>,
+    remaining: Option<u64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RapidCheckResult {
+    checked_rules: usize,
+    requests: usize,
+    observed_lots: usize,
+    new_lots: usize,
+    baseline: bool,
+    throttled: bool,
+    rate_limit: Option<u64>,
+    rate_remaining: Option<u64>,
+    rate_reset_at: Option<i64>,
+    errors: Vec<String>,
+    matches: Vec<MatchRecord>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuleSummary {
@@ -301,6 +637,32 @@ struct RuleSummary {
     current_min_unit: Option<f64>,
     history_median_unit: Option<f64>,
     checked_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveLotView {
+    item_id: String,
+    amount: i64,
+    buyout: Option<i64>,
+    unit_price: Option<f64>,
+    current_price: Option<i64>,
+    quality: Option<String>,
+    upgrade: Option<i64>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    matches_rule: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveLotsResponse {
+    total: usize,
+    returned: usize,
+    markets: usize,
+    complete_markets: usize,
+    collected_at: Option<String>,
+    lots: Vec<ActiveLotView>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -555,7 +917,7 @@ fn match_missing_lots_to_sales_in(
                 "SELECT s.fingerprint, s.sold_timestamp, s.amount, s.price, s.quality_code, s.upgrade
                  FROM sales s LEFT JOIN lot_sale_matches m ON m.sale_fingerprint = s.fingerprint
                  WHERE s.item_id = ?1 AND s.region = ?2 AND s.sold_timestamp BETWEEN ?3 AND ?4
-                   AND s.amount = ?5 AND s.source = 'stalzone_api' AND m.sale_fingerprint IS NULL"
+                   AND s.amount = ?5 AND m.sale_fingerprint IS NULL"
             ).map_err(|error| error.to_string())?;
             let rows = statement.query_map(
                 params![item_id, &region, last_seen - 60, missing_since + 120, lot_amount],
@@ -672,7 +1034,7 @@ async fn import_schistory_history(
     if !matches!(region.as_str(), "RU" | "EU") { return Err("SCHistory поддерживает импорт только для RU и EU".into()); }
     if quality_codes.is_empty() { return Err("Выберите хотя бы одну редкость для импорта".into()); }
     if quality_codes.iter().any(|code| !(0..=5).contains(code)) { return Err("Неизвестная редкость артефакта".into()); }
-    market_filters(&[], min_upgrade, max_upgrade)?;
+    market_filters(&[], min_upgrade, max_upgrade, None, None)?;
 
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(90)).build()
         .map_err(|error| format!("Не удалось создать клиент SCHistory: {error}"))?;
@@ -798,12 +1160,23 @@ fn save_schistory_sales_to(
 fn load_cached_history(item_id: &str, region: &str, days: i64, limit: usize) -> Result<Vec<Value>, String> {
     let region = region.to_ascii_uppercase();
     let connection = open_cache()?;
-    let cutoff = chrono::Utc::now().timestamp() - days.max(1) * 86_400;
+    load_cached_history_from(&connection, item_id, &region, days, limit, chrono::Utc::now())
+}
+
+fn load_cached_history_from(
+    connection: &Connection,
+    item_id: &str,
+    region: &str,
+    days: i64,
+    limit: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<Value>, String> {
+    let cutoff = now.timestamp() - days.max(1) * 86_400;
     let mut statement = connection.prepare(
         "SELECT raw_json FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3
          ORDER BY sold_timestamp DESC LIMIT ?4"
     ).map_err(|error| error.to_string())?;
-    let rows = statement.query_map(params![item_id, region, cutoff, limit as i64], |row| row.get::<_, String>(0))
+    let rows = statement.query_map(params![item_id, region.to_ascii_uppercase(), cutoff, limit as i64], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())?;
     Ok(rows.filter_map(Result::ok).filter_map(|raw| serde_json::from_str(&raw).ok()).collect())
 }
@@ -1049,6 +1422,27 @@ fn lot_upgrade(lot: &Value) -> Option<i64> {
 }
 
 fn amount(lot: &Value) -> i64 { parse_i64(lot.get("amount")).unwrap_or(0) }
+
+fn amount_band(value: i64) -> (i64, i64, &'static str) {
+    match value {
+        ..=1 => (1, 1, "1 шт."),
+        2..=4 => (2, 4, "2–4 шт."),
+        5..=9 => (5, 9, "5–9 шт."),
+        10..=19 => (10, 19, "10–19 шт."),
+        20..=49 => (20, 49, "20–49 шт."),
+        _ => (50, i64::MAX, "50+ шт."),
+    }
+}
+
+fn amount_in_band(value: i64, min: i64, max: i64) -> bool {
+    value >= min && value <= max
+}
+fn infer_stackability(amounts: &[i64]) -> (String, usize, i64) {
+    let stack_evidence = amounts.iter().filter(|amount| **amount > 1).count();
+    let max_observed_amount = amounts.iter().copied().max().unwrap_or(1);
+    let kind = if stack_evidence > 0 { "stackable" } else if amounts.len() >= 20 { "single" } else { "unknown" };
+    (kind.into(), stack_evidence, max_observed_amount)
+}
 fn price(lot: &Value, key: &str) -> Option<i64> { parse_i64(lot.get(key)) }
 fn unit_price(lot: &Value, key: &str) -> Option<f64> {
     let count = amount(lot);
@@ -1059,6 +1453,7 @@ fn unit_price(lot: &Value, key: &str) -> Option<f64> {
 fn variant_matches(rule: &WatchRule, lot: &Value) -> bool {
     let count = amount(lot);
     if rule.min_amount.is_some_and(|min| count < min) { return false; }
+    if rule.max_amount.is_some_and(|max| count > max) { return false; }
     if !rule.artifact_qualities.is_empty() {
         let Some(code) = lot_quality_code(lot) else { return false };
         let Some(name) = quality_name(code) else { return false };
@@ -1257,6 +1652,44 @@ async fn request_lots_page(rule: &WatchRule, limit: usize, offset: usize) -> Res
         payload.get("lots").and_then(Value::as_array).cloned().unwrap_or_default()))
 }
 
+fn response_rate_limit(headers: &HeaderMap) -> RateLimitState {
+    let parse = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+    RateLimitState {
+        limit: parse("x-ratelimit-limit"),
+        remaining: parse("x-ratelimit-remaining"),
+        reset_at: parse("x-ratelimit-reset").and_then(|value| i64::try_from(value).ok()),
+    }
+}
+
+async fn request_recent_lots(rule: &WatchRule) -> (Result<(u64, Vec<Value>), String>, RateLimitState) {
+    let headers = match api_headers() {
+        Ok(headers) => headers,
+        Err(error) => return (Err(error), RateLimitState::default()),
+    };
+    let limit = rule.rapid_limit.clamp(1, 10);
+    let url = format!("{API_BASE}/{}/auction/{}/lots?limit={limit}&offset=0&additional={}&sort=time_created&order=desc",
+        rule.region.to_ascii_uppercase(), urlencoding::encode(&rule.item_id), rule.additional);
+    let response = match reqwest::Client::new().get(&url).headers(headers).send().await {
+        Ok(response) => response,
+        Err(error) => return (Err(format!("Ошибка сети: {error}")), RateLimitState::default()),
+    };
+    let rate = response_rate_limit(response.headers());
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => return (Err(error.to_string()), rate),
+    };
+    if !status.is_success() {
+        return (Err(format!("HTTP {}: {}", status.as_u16(), body)), rate);
+    }
+    let payload: Value = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(error) => return (Err(format!("API вернул некорректный JSON: {error}")), rate),
+    };
+    (Ok((payload.get("total").and_then(Value::as_u64).unwrap_or_default(),
+        payload.get("lots").and_then(Value::as_array).cloned().unwrap_or_default())), rate)
+}
+
 async fn request_lots_for_collection(rule: &WatchRule, cap: usize) -> Result<(u64, Vec<Value>, bool), String> {
     let cap = cap.clamp(200, 2_000);
     let mut rows = Vec::new();
@@ -1345,10 +1778,12 @@ fn collection_market_values(
          WHERE o.collection_id = ?1
            AND (?2 = 0 OR (t.quality_code IS NOT NULL AND (?2 & (1 << t.quality_code)) != 0))
            AND (?3 IS NULL OR t.upgrade >= ?3)
-           AND (?4 IS NULL OR t.upgrade <= ?4)"
+           AND (?4 IS NULL OR t.upgrade <= ?4)
+           AND (?5 IS NULL OR o.amount >= ?5)
+           AND (?6 IS NULL OR o.amount <= ?6)"
     ).map_err(|error| error.to_string())?;
     let rows = statement.query_map(
-        params![collection_id, filters.quality_mask, filters.min_upgrade, filters.max_upgrade],
+        params![collection_id, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount],
         |row| row.get::<_, Option<f64>>(0)
     )
         .map_err(|error| error.to_string())?;
@@ -1363,8 +1798,10 @@ fn market_movement(
     qualities: Vec<String>,
     min_upgrade: Option<i64>,
     max_upgrade: Option<i64>,
+    min_amount: Option<i64>,
+    max_amount: Option<i64>,
 ) -> Result<MarketMovementResponse, String> {
-    let filters = market_filters(&qualities, min_upgrade, max_upgrade)?;
+    let filters = market_filters(&qualities, min_upgrade, max_upgrade, min_amount, max_amount)?;
     reconcile_all_sale_matches()?;
     let connection = open_cache()?;
     market_movement_from(&connection, hours, region, filters, chrono::Utc::now())
@@ -1374,6 +1811,8 @@ fn market_filters(
     qualities: &[String],
     min_upgrade: Option<i64>,
     max_upgrade: Option<i64>,
+    min_amount: Option<i64>,
+    max_amount: Option<i64>,
 ) -> Result<MovementFilters, String> {
     if min_upgrade.is_some_and(|value| !(0..=15).contains(&value))
         || max_upgrade.is_some_and(|value| !(0..=15).contains(&value)) {
@@ -1382,10 +1821,19 @@ fn market_filters(
     if min_upgrade.zip(max_upgrade).is_some_and(|(min, max)| min > max) {
         return Err("Минимальная заточка не может быть больше максимальной".into());
     }
+    if min_amount.is_some_and(|value| !(1..=100_000).contains(&value))
+        || max_amount.is_some_and(|value| !(1..=100_000).contains(&value)) {
+        return Err("Количество должно быть в диапазоне от 1 до 100 000".into());
+    }
+    if min_amount.zip(max_amount).is_some_and(|(min, max)| min > max) {
+        return Err("Минимальное количество не может быть больше максимального".into());
+    }
     Ok(MovementFilters {
         quality_mask: qualities.iter().filter_map(|name| quality_code(name)).fold(0, |mask, code| mask | (1 << code)),
         min_upgrade,
         max_upgrade,
+        min_amount,
+        max_amount,
     })
 }
 
@@ -1412,7 +1860,7 @@ fn market_timing(
     max_upgrade: Option<i64>,
     timezone_offset_minutes: i64,
 ) -> Result<MarketTimingResponse, String> {
-    let filters = market_filters(&qualities, min_upgrade, max_upgrade)?;
+    let filters = market_filters(&qualities, min_upgrade, max_upgrade, None, None)?;
     let connection = open_cache()?;
     market_timing_from(
         &connection,
@@ -1536,47 +1984,81 @@ fn market_movement_from(
         let appeared = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND first_seen_timestamp >= ?3
              AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+             AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let disappeared = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND missing_since_timestamp >= ?3
              AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+             AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
-        let official_sales = connection.query_row(
-            "SELECT COUNT(*) FROM sales WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3
-             AND source = 'stalzone_api'
-             AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
-        ).unwrap_or_default();
+        let sale_rows: Vec<(i64, i64, i64, String)> = {
+            let mut statement = connection.prepare(
+                "SELECT sold_timestamp, amount, price, source FROM sales
+                 WHERE item_id = ?1 AND region = ?2 AND sold_timestamp >= ?3
+                   AND amount > 0 AND price > 0
+                   AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
+                   AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+                   AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)
+                 ORDER BY sold_timestamp"
+            ).map_err(|error| error.to_string())?;
+            let rows = statement.query_map(
+                params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            ).map_err(|error| error.to_string())?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let recorded_sales = sale_rows.len() as u64;
+        let schistory_sales = sale_rows.iter().filter(|row| row.3 == "schistory").count() as u64;
+        let stalzone_sales = recorded_sales.saturating_sub(schistory_sales);
+        let bucket_seconds = match hours { 24 => 900, 168 => 3_600, _ => 14_400 };
+        let mut sale_buckets: HashMap<i64, Vec<(f64, i64)>> = HashMap::new();
+        for (timestamp, amount, total_price, _) in &sale_rows {
+            let bucket = timestamp.div_euclid(bucket_seconds) * bucket_seconds;
+            sale_buckets.entry(bucket).or_default().push((*total_price as f64 / *amount as f64, *amount));
+        }
+        let mut sale_points: Vec<MovementSalePoint> = sale_buckets.into_iter().filter_map(|(time, rows)| {
+            let prices: Vec<f64> = rows.iter().map(|row| row.0).collect();
+            Some(MovementSalePoint {
+                time,
+                median_unit: median(&prices)?,
+                sales: rows.len(),
+                units: rows.iter().map(|row| row.1).sum(),
+            })
+        }).collect();
+        sale_points.sort_by_key(|point| point.time);
         let probable_sales = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2
              AND status = 'probable_sold' AND missing_since_timestamp >= ?3
              AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+             AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let unexplained_missing = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2
              AND status = 'missing' AND missing_since_timestamp >= ?3
              AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+             AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let ended = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'ended' AND end_timestamp >= ?3
              AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
+             AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+             AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let active_lots = connection.query_row(
             "SELECT COUNT(*) FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status = 'active'
              AND (?3 = 0 OR (quality_code IS NOT NULL AND (?3 & (1 << quality_code)) != 0))
-             AND (?4 IS NULL OR upgrade >= ?4) AND (?5 IS NULL OR upgrade <= ?5)",
-            params![&item_id, &market_region, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, u64>(0)
+             AND (?4 IS NULL OR upgrade >= ?4) AND (?5 IS NULL OR upgrade <= ?5)
+             AND (?6 IS NULL OR amount >= ?6) AND (?7 IS NULL OR amount <= ?7)",
+            params![&item_id, &market_region, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, u64>(0)
         ).unwrap_or_default();
         let average_lifetime_minutes = connection.query_row(
             "SELECT AVG(CASE
@@ -1585,8 +2067,9 @@ fn market_movement_from(
              FROM tracked_lots WHERE item_id = ?1 AND region = ?2 AND status IN ('missing', 'probable_sold', 'ended')
                AND COALESCE(missing_since_timestamp, end_timestamp) >= ?3
                AND (?4 = 0 OR (quality_code IS NOT NULL AND (?4 & (1 << quality_code)) != 0))
-               AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)",
-            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| row.get::<_, Option<f64>>(0)
+               AND (?5 IS NULL OR upgrade >= ?5) AND (?6 IS NULL OR upgrade <= ?6)
+               AND (?7 IS NULL OR amount >= ?7) AND (?8 IS NULL OR amount <= ?8)",
+            params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| row.get::<_, Option<f64>>(0)
         ).unwrap_or(None);
         let mut events = Vec::new();
         {
@@ -1602,11 +2085,12 @@ fn market_movement_from(
                         OR (status = 'ended' AND end_timestamp >= ?3))
                    AND (?4 = 0 OR (t.quality_code IS NOT NULL AND (?4 & (1 << t.quality_code)) != 0))
                    AND (?5 IS NULL OR t.upgrade >= ?5) AND (?6 IS NULL OR t.upgrade <= ?6)
+                   AND (?7 IS NULL OR t.amount >= ?7) AND (?8 IS NULL OR t.amount <= ?8)
                  ORDER BY MAX(first_seen_timestamp, COALESCE(missing_since_timestamp, 0), COALESCE(end_timestamp, 0)) DESC
                  LIMIT 100"
             ).map_err(|error| error.to_string())?;
             type EventRow = (String, i64, Option<String>, Option<i64>, String, Option<String>, Option<i64>, i64, Option<i64>, Option<f64>, Option<String>, Option<i64>, Option<i64>);
-            let rows = statement.query_map(params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade], |row| Ok(EventRow::from((
+            let rows = statement.query_map(params![&item_id, &market_region, cutoff, filters.quality_mask, filters.min_upgrade, filters.max_upgrade, filters.min_amount, filters.max_amount], |row| Ok(EventRow::from((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
                 row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
                 row.get(11)?, row.get(12)?
@@ -1642,7 +2126,7 @@ fn market_movement_from(
             .and_then(|(start, current)| (start > 0.0).then_some((current - start) / start * 100.0));
         if filters.active()
             && points.iter().all(|point| point.supply == 0)
-            && appeared + disappeared + official_sales + probable_sales + unexplained_missing + ended + active_lots == 0 {
+            && appeared + disappeared + recorded_sales + probable_sales + unexplained_missing + ended + active_lots == 0 {
             continue;
         }
         let signal = if points.len() < 2 {
@@ -1662,10 +2146,11 @@ fn market_movement_from(
             supply_change_percent,
             current_min_unit: last.and_then(|point| point.min_unit),
             current_median_unit: last.and_then(|point| point.median_unit),
-            price_change_percent, appeared, disappeared, official_sales, probable_sales, unexplained_missing, ended, active_lots,
+            price_change_percent, appeared, disappeared, recorded_sales, schistory_sales, stalzone_sales,
+            probable_sales, unexplained_missing, ended, active_lots,
             average_lifetime_minutes, collections: collection_stats.0,
             coverage_percent: collection_stats.1 as f64 / collection_stats.0 as f64 * 100.0,
-            last_collected, signal, points, events,
+            last_collected, signal, points, sale_points, events,
         });
     }
     movements.sort_by(|a, b| b.disappeared.cmp(&a.disappeared).then_with(|| b.appeared.cmp(&a.appeared)));
@@ -1677,13 +2162,31 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
     let mut insights = Vec::new();
     for original_rule in rules {
         let mut rule = original_rule.clone();
-        rule.limit = 200;
         rule.history_limit = 200;
-        let lots = request_collection(&rule, false).await?;
+        let (_, lots, _) = request_lots_for_collection(&rule, 2_000).await?;
         sync_history_for_rule(&rule).await?;
-        let history = load_cached_history(&rule.item_id, &rule.region, 30, 20_000)?;
-        let comparable_lots: Vec<&Value> = lots.iter().filter(|lot| variant_matches(&rule, lot)).collect();
-        let comparable_history: Vec<&Value> = history.iter().filter(|lot| variant_matches(&rule, lot)).collect();
+        let history = load_cached_history(
+            &rule.item_id, &rule.region, ANALYTICS_HISTORY_DAYS, ANALYTICS_HISTORY_LIMIT,
+        )?;
+        let mut stack_rule = rule.clone();
+        stack_rule.min_amount = None;
+        stack_rule.max_amount = None;
+        let stack_active: Vec<&Value> = lots.iter().filter(|lot| variant_matches(&stack_rule, lot)).collect();
+        let stack_history: Vec<&Value> = history.iter().filter(|lot| variant_matches(&stack_rule, lot)).collect();
+        let stack_amounts: Vec<i64> = stack_active.iter().chain(stack_history.iter()).map(|lot| amount(lot)).collect();
+        let (stackability, stack_evidence, max_observed_amount) = infer_stackability(&stack_amounts);
+        let all_comparable_lots: Vec<&Value> = lots.iter().filter(|lot| variant_matches(&rule, lot)).collect();
+        let current_min_lot = all_comparable_lots.iter().filter_map(|lot| {
+            unit_price(lot, "buyoutPrice").map(|unit| (*lot, unit))
+        }).min_by(|a, b| a.1.total_cmp(&b.1));
+        let current_min_amount = current_min_lot.map(|(lot, _)| amount(lot));
+        let (amount_min, amount_max, comparison_amount_label) = current_min_amount
+            .map(amount_band).unwrap_or((1, i64::MAX, "все размеры"));
+        let comparable_lots: Vec<&Value> = all_comparable_lots.iter().copied()
+            .filter(|lot| amount_in_band(amount(lot), amount_min, amount_max)).collect();
+        let comparable_history: Vec<&Value> = history.iter().filter(|lot| {
+            variant_matches(&rule, lot) && amount_in_band(amount(lot), amount_min, amount_max)
+        }).collect();
         let current_units: Vec<f64> = comparable_lots.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
         let history_units: Vec<f64> = comparable_history.iter().filter_map(|lot| unit_price(lot, "price")).collect();
         let current_min = current_units.iter().copied().min_by(f64::total_cmp);
@@ -1727,14 +2230,25 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
         if volatility.is_some_and(|value| value > 35.0) { risks.push("Высокий разброс цены".into()); }
         if liquidity == "Низкая" { risks.push("Медленные продажи".into()); }
         if discount.is_some_and(|value| value < 0.0) { risks.push("Минимум выше адаптивной цены".into()); }
-        if comparable_lots.len() <= 2 { risks.push("Мало активных предложений".into()); }
+        if comparable_lots.len() <= 2 { risks.push("Мало активных предложений такого размера".into()); }
 
         let matching_lots = comparable_lots.iter().filter(|lot| lot_matches(&rule, lot, &current_units, history_median)).count();
         save_market_snapshot(&rule, &lots, matching_lots)?;
+        let mut movement_rule = rule.clone();
+        movement_rule.min_amount = Some(amount_min);
+        movement_rule.max_amount = (amount_max != i64::MAX).then_some(amount_max);
+        let (movement_supply_change_percent, movement_price_change_percent, movement_collections, movement_coverage_percent) =
+            comparable_movement_summary(&movement_rule, chrono::Utc::now())?;
         insights.push(MarketInsight {
             name: rule.name, item_id: rule.item_id, region: rule.region,
-            artifact_qualities: rule.artifact_qualities, min_upgrade: rule.min_upgrade, max_upgrade: rule.max_upgrade,
-            active_lots: comparable_lots.len(), matching_lots, sales_sample: history_units.len(),
+            artifact_qualities: rule.artifact_qualities, min_amount: rule.min_amount,
+            min_upgrade: rule.min_upgrade, max_upgrade: rule.max_upgrade,
+            active_lots: comparable_lots.len(), all_active_lots: all_comparable_lots.len(), matching_lots,
+            current_min_amount, comparison_amount_label: comparison_amount_label.into(),
+            comparison_amount_min: amount_min,
+            comparison_amount_max: (amount_max != i64::MAX).then_some(amount_max),
+            stackability, stack_evidence, max_observed_amount,
+            sales_sample: history_units.len(),
             sold_amount: comparable_history.iter().map(|row| amount(row)).sum(),
             current_min_unit: current_min, median_unit: history_median, fair_value_unit: adaptive.fair_value,
             recent_median_unit: adaptive.recent_median, recent_p25_unit: adaptive.recent_p25,
@@ -1743,11 +2257,282 @@ async fn market_analytics(rules: Vec<WatchRule>) -> Result<MarketAnalyticsRespon
             average_unit: average,
             p25_unit: p25, p75_unit: p75, discount_percent: discount, trend_percent: trend,
             volatility_percent: volatility, sales_per_day, average_sale_interval_minutes: average_interval,
+            movement_supply_change_percent, movement_price_change_percent,
+            movement_collections, movement_coverage_percent,
             opportunity_score: score, liquidity, verdict, risks,
         });
     }
     insights.sort_by(|a, b| b.opportunity_score.cmp(&a.opportunity_score));
     Ok(MarketAnalyticsResponse { generated_at: chrono::Utc::now().to_rfc3339(), insights })
+}
+
+fn comparable_movement_summary(
+    rule: &WatchRule,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(Option<f64>, Option<f64>, u64, f64), String> {
+    let connection = open_cache()?;
+    let region = rule.region.to_ascii_uppercase();
+    let cutoff = now.timestamp() - 86_400;
+    let (collections, complete): (u64, u64) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(complete), 0) FROM market_collections
+         WHERE item_id = ?1 AND region = ?2 AND collected_timestamp >= ?3",
+        params![rule.item_id, &region, cutoff],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap_or_default();
+    let ids: Vec<i64> = {
+        let mut statement = connection.prepare(
+            "SELECT id FROM market_collections
+             WHERE item_id = ?1 AND region = ?2 AND collected_timestamp >= ?3 AND complete = 1
+             ORDER BY collected_timestamp"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map(params![rule.item_id, &region, cutoff], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let endpoints = ids.first().copied().zip(ids.last().copied());
+    let (supply_change, price_change) = if let Some((first_id, last_id)) = endpoints {
+        let first = collection_variant_values(&connection, first_id, rule)?;
+        let last = collection_variant_values(&connection, last_id, rule)?;
+        let supply = (first.0 > 0).then_some((last.0 as f64 - first.0 as f64) / first.0 as f64 * 100.0);
+        let prices = median(&first.2).zip(median(&last.2))
+            .and_then(|(start, current)| (start > 0.0).then_some((current - start) / start * 100.0));
+        (supply, prices)
+    } else { (None, None) };
+    let coverage = if collections > 0 { complete as f64 / collections as f64 * 100.0 } else { 0.0 };
+    Ok((supply_change, price_change, collections, coverage))
+}
+
+fn collection_variant_values(connection: &Connection, collection_id: i64, rule: &WatchRule) -> Result<(usize, i64, Vec<f64>), String> {
+    let mut statement = connection.prepare(
+        "SELECT raw_json FROM lot_observations WHERE collection_id = ?1"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![collection_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let values: Vec<Value> = rows.filter_map(Result::ok).filter_map(|raw| serde_json::from_str(&raw).ok())
+        .filter(|lot| variant_matches(rule, lot)).collect();
+    let units = values.iter().map(amount).sum();
+    let prices = values.iter().filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
+    Ok((values.len(), units, prices))
+}
+
+fn deep_price_window(timed: &[(i64, f64, i64)], latest: i64, hours: i64) -> DeepPriceWindow {
+    let rows: Vec<(f64, i64)> = timed.iter().filter(|(timestamp, _, _)| latest - *timestamp <= hours * 3_600)
+        .map(|(_, price, amount)| (*price, *amount)).collect();
+    let prices: Vec<f64> = rows.iter().map(|(price, _)| *price).collect();
+    DeepPriceWindow {
+        hours,
+        sales: rows.len(),
+        units: rows.iter().map(|(_, amount)| *amount).sum(),
+        p25_unit: percentile(&prices, 0.25),
+        median_unit: median(&prices),
+        p75_unit: percentile(&prices, 0.75),
+    }
+}
+
+#[tauri::command]
+fn stack_strategy_analysis(
+    rule: WatchRule,
+    buy_max_amount: i64,
+    sell_min_amount: i64,
+    target_amount: i64,
+    fee_percent: f64,
+    max_buy_unit: Option<f64>,
+) -> Result<StackStrategyAnalysis, String> {
+    if !(1..=10_000).contains(&buy_max_amount) || !(1..=10_000).contains(&sell_min_amount)
+        || !(1..=10_000).contains(&target_amount) {
+        return Err("Размеры пачек должны быть от 1 до 10 000".into());
+    }
+    if target_amount < sell_min_amount { return Err("Целевая пачка должна быть не меньше продаваемой пачки".into()); }
+    if max_buy_unit.is_some_and(|price| !price.is_finite() || price <= 0.0) { return Err("Некорректный лимит закупки".into()); }
+    let connection = open_cache()?;
+    stack_strategy_from(
+        &connection, &rule, buy_max_amount, sell_min_amount, target_amount,
+        fee_percent.clamp(0.0, 50.0), max_buy_unit, chrono::Utc::now(),
+    )
+}
+
+fn stack_strategy_from(
+    connection: &Connection,
+    rule: &WatchRule,
+    buy_max_amount: i64,
+    sell_min_amount: i64,
+    target_amount: i64,
+    fee_percent: f64,
+    max_buy_unit: Option<f64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StackStrategyAnalysis, String> {
+    let mut variant_rule = rule.clone();
+    variant_rule.min_amount = None;
+    variant_rule.max_amount = None;
+    let region = rule.region.to_ascii_uppercase();
+    let latest_collection: Option<i64> = connection.query_row(
+        "SELECT id FROM market_collections WHERE item_id = ?1 AND region = ?2 AND complete = 1 ORDER BY collected_timestamp DESC LIMIT 1",
+        params![rule.item_id, &region], |row| row.get(0)
+    ).ok();
+    let mut candidates: Vec<(i64, i64, f64)> = if let Some(collection_id) = latest_collection {
+        let mut statement = connection.prepare(
+            "SELECT amount, buyout_price, raw_json FROM lot_observations
+             WHERE collection_id = ?1 AND buyout_price > 0 AND amount > 0"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map(params![collection_id], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?
+        ))).map_err(|error| error.to_string())?;
+        rows.filter_map(Result::ok).filter_map(|(amount, buyout, raw)| {
+            let lot: Value = serde_json::from_str(&raw).ok()?;
+            let unit = buyout as f64 / amount as f64;
+            (amount <= buy_max_amount && variant_matches(&variant_rule, &lot)
+                && max_buy_unit.is_none_or(|limit| unit <= limit)).then_some((amount, buyout, unit))
+        }).collect()
+    } else { Vec::new() };
+    candidates.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.cmp(&a.0)));
+    let available_lots = candidates.len();
+    let available_units = candidates.iter().map(|row| row.0).sum();
+    let cheapest_buy_unit = candidates.first().map(|row| row.2);
+    let mut acquired_amount = 0;
+    let mut total_cost = 0;
+    let mut purchase_lots = 0;
+    for (amount, buyout, _) in &candidates {
+        if acquired_amount >= target_amount { break; }
+        acquired_amount += *amount;
+        total_cost += *buyout;
+        purchase_lots += 1;
+    }
+    let average_buy_unit = (acquired_amount > 0).then_some(total_cost as f64 / acquired_amount as f64);
+
+    let history = load_cached_history_from(
+        connection, &rule.item_id, &region, ANALYTICS_HISTORY_DAYS, ANALYTICS_HISTORY_LIMIT, now,
+    )?;
+    let mut timed_bulk: Vec<(i64, f64)> = history.iter().filter(|row| {
+        variant_matches(&variant_rule, row) && amount(row) >= sell_min_amount
+    }).filter_map(|row| {
+        let timestamp = chrono::DateTime::parse_from_rfc3339(row.get("time")?.as_str()?).ok()?.timestamp();
+        Some((timestamp, unit_price(row, "price")?))
+    }).collect();
+    timed_bulk.sort_by(|a, b| b.0.cmp(&a.0));
+    let history_median = median(&timed_bulk.iter().map(|row| row.1).collect::<Vec<_>>());
+    let adaptive = adaptive_market_price(&timed_bulk, history_median);
+    let volatility = adaptive.volatility_percent.unwrap_or(20.0);
+    let negative_trend = adaptive.trend_percent.unwrap_or_default().min(0.0).abs();
+    let haircut = ((volatility * 0.15).max(2.0) + (negative_trend * 0.25).min(5.0)).min(12.0);
+    let expected_sell_unit = adaptive.fair_value.map(|fair| fair * (1.0 - haircut / 100.0));
+    let fee = fee_percent / 100.0;
+    let net_revenue = expected_sell_unit.map(|sell| sell * acquired_amount as f64 * (1.0 - fee));
+    let profit = net_revenue.map(|revenue| revenue - total_cost as f64);
+    let roi_percent = profit.zip((total_cost > 0).then_some(total_cost as f64)).map(|(profit, cost)| profit / cost * 100.0);
+    let break_even_buy_unit = expected_sell_unit.map(|sell| sell * (1.0 - fee));
+    let complete = acquired_amount >= target_amount && acquired_amount >= sell_min_amount;
+    let mut warnings = Vec::new();
+    if latest_collection.is_none() { warnings.push("Нет полного снимка активного рынка".into()); }
+    if !complete { warnings.push(format!("Не хватает товара: найдено {acquired_amount} из {target_amount}")); }
+    if adaptive.recent_sample < 30 { warnings.push(format!("Мало недавних крупных продаж: {}", adaptive.recent_sample)); }
+    if acquired_amount > target_amount { warnings.push(format!("Цель превышена на {} из-за покупки целых лотов", acquired_amount - target_amount)); }
+    if average_buy_unit.zip(break_even_buy_unit).is_some_and(|(buy, limit)| buy >= limit) { warnings.push("Средняя закупка выше точки безубыточности".into()); }
+    Ok(StackStrategyAnalysis {
+        buy_max_amount, sell_min_amount, target_amount, acquired_amount, purchase_lots,
+        available_lots, available_units, total_cost, average_buy_unit, cheapest_buy_unit,
+        expected_sell_unit, recent_bulk_median_unit: adaptive.recent_median,
+        bulk_sales_sample: adaptive.recent_sample, net_revenue, profit, roi_percent,
+        break_even_buy_unit, complete, warnings,
+    })
+}
+
+#[tauri::command]
+fn market_deep_analysis(rule: WatchRule, fee_percent: f64) -> Result<MarketDeepAnalysis, String> {
+    let now = chrono::Utc::now();
+    let history = load_cached_history(
+        &rule.item_id, &rule.region, ANALYTICS_HISTORY_DAYS, ANALYTICS_HISTORY_LIMIT,
+    )?;
+    let comparable: Vec<&Value> = history.iter().filter(|row| variant_matches(&rule, row)).collect();
+    let mut timed: Vec<(i64, f64, i64)> = comparable.iter().filter_map(|row| {
+        let timestamp = chrono::DateTime::parse_from_rfc3339(row.get("time")?.as_str()?).ok()?.timestamp();
+        Some((timestamp, unit_price(row, "price")?, amount(row)))
+    }).collect();
+    timed.sort_by(|a, b| b.0.cmp(&a.0));
+    let latest = timed.first().map(|row| row.0).unwrap_or_else(|| now.timestamp());
+    let windows: Vec<DeepPriceWindow> = [1, 3, 6, 12, 24].into_iter()
+        .map(|hours| deep_price_window(&timed, latest, hours)).collect();
+    let history_hours = timed.first().zip(timed.last()).map(|(newest, oldest)| (newest.0 - oldest.0) as f64 / 3_600.0).unwrap_or_default();
+
+    let mut all_amounts_rule = rule.clone();
+    all_amounts_rule.min_amount = None;
+    all_amounts_rule.max_amount = None;
+    let recent_all_amounts: Vec<&Value> = history.iter().filter(|row| variant_matches(&all_amounts_rule, row)).filter(|row| {
+        row.get("time").and_then(Value::as_str).and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .is_some_and(|time| latest - time.timestamp() <= 86_400)
+    }).collect();
+    let segments = [("1", 1, 1), ("2–4", 2, 4), ("5–9", 5, 9), ("10–19", 10, 19), ("20+", 20, i64::MAX)];
+    let stack_segments: Vec<DeepStackSegment> = segments.into_iter().map(|(label, min, max)| {
+        let rows: Vec<&&Value> = recent_all_amounts.iter().filter(|row| (min..=max).contains(&amount(row))).collect();
+        let prices: Vec<f64> = rows.iter().filter_map(|row| unit_price(row, "price")).collect();
+        DeepStackSegment { label: label.into(), sales: rows.len(), units: rows.iter().map(|row| amount(row)).sum(), median_unit: median(&prices) }
+    }).collect();
+
+    let connection = open_cache()?;
+    let region = rule.region.to_ascii_uppercase();
+    let collection_stats: (u64, u64) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(complete), 0) FROM market_collections WHERE item_id = ?1 AND region = ?2",
+        params![rule.item_id, &region], |row| Ok((row.get(0)?, row.get(1)?))
+    ).unwrap_or_default();
+    let latest_collection: Option<(i64, i64)> = connection.query_row(
+        "SELECT id, collected_timestamp FROM market_collections WHERE item_id = ?1 AND region = ?2 AND complete = 1 ORDER BY collected_timestamp DESC LIMIT 1",
+        params![rule.item_id, &region], |row| Ok((row.get(0)?, row.get(1)?))
+    ).ok();
+    let (current_supply, current_units, current_prices) = latest_collection
+        .map(|(id, _)| collection_variant_values(&connection, id, &rule)).transpose()?.unwrap_or_default();
+    let current_min = current_prices.iter().copied().min_by(f64::total_cmp);
+    let current_median = median(&current_prices);
+    let first_supply = latest_collection.and_then(|(_, timestamp)| connection.query_row(
+        "SELECT id FROM market_collections WHERE item_id = ?1 AND region = ?2 AND complete = 1 AND collected_timestamp >= ?3 ORDER BY collected_timestamp LIMIT 1",
+        params![rule.item_id, &region, timestamp - 86_400], |row| row.get::<_, i64>(0)
+    ).ok()).map(|id| collection_variant_values(&connection, id, &rule)).transpose()?.map(|row| row.0);
+    let supply_change_percent = first_supply.filter(|supply| *supply > 0)
+        .map(|supply| (current_supply as f64 - supply as f64) / supply as f64 * 100.0);
+
+    let step = current_min.map(|price| if price >= 1_000_000.0 { 100_000.0 } else if price >= 100_000.0 { 10_000.0 } else if price >= 10_000.0 { 1_000.0 } else { 100.0 }).unwrap_or(1.0);
+    let depth: Vec<MarketDepthLevel> = current_min.map(|minimum| [0.0, 1.0, 2.0, 3.0, 5.0].into_iter().map(|offset| {
+        let threshold = (minimum / step).ceil() * step + offset * step;
+        let rows: Vec<(i64, f64)> = latest_collection.map(|(id, _)| {
+            let mut statement = connection.prepare("SELECT amount, buyout_price * 1.0 / amount, raw_json FROM lot_observations WHERE collection_id = ?1 AND buyout_price > 0 AND amount > 0").ok()?;
+            let mapped = statement.query_map(params![id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?))).ok()?;
+            Some(mapped.filter_map(Result::ok).filter_map(|(amount, price, raw)| serde_json::from_str::<Value>(&raw).ok().filter(|lot| variant_matches(&rule, lot)).map(|_| (amount, price))).filter(|(_, price)| *price <= threshold).collect())
+        }).flatten().unwrap_or_default();
+        MarketDepthLevel { price: threshold, lots: rows.len(), units: rows.iter().map(|(amount, _)| *amount).sum() }
+    }).collect()).unwrap_or_default();
+
+    let timed_prices: Vec<(i64, f64)> = timed.iter().map(|(timestamp, price, _)| (*timestamp, *price)).collect();
+    let adaptive = adaptive_market_price(&timed_prices, median(&timed_prices.iter().map(|(_, price)| *price).collect::<Vec<_>>()));
+    let volatility = adaptive.volatility_percent.unwrap_or(20.0);
+    let negative_trend = adaptive.trend_percent.unwrap_or_default().min(0.0).abs();
+    let haircut = (volatility * 0.15).max(2.0) + (negative_trend * 0.25).min(5.0);
+    let expected_sell = adaptive.fair_value.map(|fair| fair * (1.0 - haircut.min(12.0) / 100.0));
+    let fee = fee_percent.clamp(0.0, 50.0) / 100.0;
+    let buy_for_five = expected_sell.map(|sell| sell * (1.0 - fee) / 1.05);
+    let buy_for_ten = expected_sell.map(|sell| sell * (1.0 - fee) / 1.10);
+
+    let mut insights = Vec::new();
+    if let (Some(short), Some(day)) = (windows[0].median_unit, windows[4].median_unit) {
+        let change = (short - day) / day * 100.0;
+        insights.push(format!("Медиана последнего часа {short:.0} ₽: {change:+.1}% к медиане 24 часов."));
+    }
+    if let (Some(ask), Some(clear)) = (current_median, windows[0].median_unit.or(windows[2].median_unit)) {
+        insights.push(format!("Медиана активных предложений {ask:.0} ₽: на {:+.1}% выше недавней цены сделок.", (ask - clear) / clear * 100.0));
+    }
+    if let Some(change) = supply_change_percent { insights.push(format!("Предложение за доступные 24 часа изменилось на {change:+.1}%.")); }
+    let single = stack_segments.iter().find(|segment| segment.label == "1").and_then(|segment| segment.median_unit);
+    let bulk = stack_segments.iter().find(|segment| segment.label == "10–19").and_then(|segment| segment.median_unit);
+    if let (Some(single), Some(bulk)) = (single, bulk) { insights.push(format!("Пачки 10–19 продаются с премией {:+.1}% к одиночным.", (bulk - single) / single * 100.0)); }
+    if let (Some(level), Some(hour)) = (depth.get(2), windows.first()) {
+        if hour.units > 0 { insights.push(format!("До цены {:.0} ₽ доступно {} единиц — примерно {:.1} часа недавнего оборота.", level.price, level.units, level.units as f64 / hour.units as f64)); }
+    }
+    if history_hours < 72.0 { insights.push(format!("История пока покрывает только {:.1} часа; недельная сезонность ненадёжна.", history_hours)); }
+
+    Ok(MarketDeepAnalysis {
+        generated_at: now.to_rfc3339(), history_hours, total_sales: timed.len(), sold_units: timed.iter().map(|row| row.2).sum(),
+        collections: collection_stats.0, complete_collections: collection_stats.1,
+        current_supply, current_units, current_min_unit: current_min, current_median_unit: current_median,
+        supply_change_percent, expected_sell_unit: expected_sell, buy_for_five_percent: buy_for_five,
+        buy_for_ten_percent: buy_for_ten, windows, stack_segments, depth, insights,
+    })
 }
 
 fn lot_matches(rule: &WatchRule, lot: &Value, current: &[f64], history_median: Option<f64>) -> bool {
@@ -1916,6 +2701,224 @@ async fn send_external_notifications(message: &str) {
 }
 
 #[tauri::command]
+fn active_lots_for_rules(rules: Vec<WatchRule>, limit: usize) -> Result<ActiveLotsResponse, String> {
+    let connection = open_cache()?;
+    active_lots_for_rules_from(&connection, &rules, limit, chrono::Utc::now())
+}
+
+fn active_lots_for_rules_from(
+    connection: &Connection,
+    rules: &[WatchRule],
+    limit: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ActiveLotsResponse, String> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut markets = 0;
+    let mut complete_markets = 0;
+    let mut latest_timestamp = i64::MIN;
+    let mut collected_at = None;
+
+    for rule in rules {
+        let region = rule.region.to_ascii_uppercase();
+        let collection = connection.query_row(
+            "SELECT id, collected_at, collected_timestamp, complete FROM market_collections
+             WHERE item_id = ?1 AND region = ?2 ORDER BY collected_timestamp DESC LIMIT 1",
+            params![rule.item_id, &region],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, bool>(3)?)),
+        ).ok();
+        let Some((collection_id, observed_at, observed_timestamp, complete)) = collection else { continue };
+        markets += 1;
+        if complete { complete_markets += 1; }
+        if observed_timestamp > latest_timestamp {
+            latest_timestamp = observed_timestamp;
+            collected_at = Some(observed_at);
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT lot_key, raw_json FROM lot_observations WHERE collection_id = ?1"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map(params![collection_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map_err(|error| error.to_string())?;
+        let lots: Vec<(String, Value)> = rows.filter_map(Result::ok).filter_map(|(key, raw)| {
+            serde_json::from_str(&raw).ok().map(|lot| (key, lot))
+        }).filter(|(_, lot)| variant_matches(rule, lot)).collect();
+        let current: Vec<f64> = lots.iter().filter_map(|(_, lot)| unit_price(lot, "buyoutPrice")).collect();
+        let history_median = if rule.max_history_median_ratio.is_some() {
+            let history = load_cached_history_from(
+                connection, &rule.item_id, &region, ANALYTICS_HISTORY_DAYS, ANALYTICS_HISTORY_LIMIT, now,
+            )?;
+            let values: Vec<f64> = history.iter().filter(|row| variant_matches(rule, row))
+                .filter_map(|row| unit_price(row, "price")).collect();
+            median(&values)
+        } else { None };
+
+        for (key, lot) in lots {
+            let unique = format!("{}|{}|{}", region, rule.item_id, key);
+            if !seen.insert(unique) { continue; }
+            result.push(ActiveLotView {
+                item_id: rule.item_id.clone(),
+                amount: amount(&lot),
+                buyout: price(&lot, "buyoutPrice").filter(|value| *value > 0),
+                unit_price: unit_price(&lot, "buyoutPrice"),
+                current_price: price(&lot, "currentPrice").filter(|value| *value > 0),
+                quality: lot_quality_code(&lot).and_then(quality_label).map(str::to_string),
+                upgrade: lot_upgrade(&lot),
+                start_time: lot.get("startTime").and_then(Value::as_str).map(str::to_string),
+                end_time: lot.get("endTime").and_then(Value::as_str).map(str::to_string),
+                matches_rule: lot_matches(rule, &lot, &current, history_median),
+            });
+        }
+    }
+
+    result.sort_by(|a, b| a.unit_price.unwrap_or(f64::INFINITY).total_cmp(&b.unit_price.unwrap_or(f64::INFINITY))
+        .then_with(|| a.buyout.unwrap_or(i64::MAX).cmp(&b.buyout.unwrap_or(i64::MAX))));
+    let total = result.len();
+    result.truncate(limit.clamp(1, 500));
+    Ok(ActiveLotsResponse {
+        total, returned: result.len(), markets, complete_markets, collected_at, lots: result,
+    })
+}
+
+fn rapid_median_key(rule: &WatchRule) -> String {
+    format!("{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        rule.region.to_ascii_uppercase(), rule.item_id, rule.artifact_qualities,
+        rule.min_amount, rule.max_amount, rule.min_upgrade, rule.max_upgrade)
+}
+
+fn update_rapid_keys(previous: &[String], current: &[String], baseline: bool) -> (HashSet<String>, Vec<String>) {
+    let previous_set: HashSet<String> = previous.iter().cloned().collect();
+    let fresh = if baseline { HashSet::new() } else {
+        current.iter().filter(|key| !previous_set.contains(*key)).cloned().collect()
+    };
+    let current_set: HashSet<String> = current.iter().cloned().collect();
+    let mut remembered = current.to_vec();
+    remembered.extend(previous.iter().filter(|key| !current_set.contains(*key)).cloned());
+    remembered.truncate(100);
+    (fresh, remembered)
+}
+
+#[tauri::command]
+async fn rapid_check_rules(
+    rules: Vec<WatchRule>,
+    baseline: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<RapidCheckResult, String> {
+    let _guard = state.rapid_lock.lock().await;
+    let state_path = workspace_file(RAPID_STATE_FILE);
+    let mut seen_state: RapidSeenState = fs::read_to_string(existing_workspace_file(RAPID_STATE_FILE)).ok()
+        .and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default();
+    let connection = open_cache()?;
+    let now = chrono::Utc::now();
+    let mut median_cache = state.rapid_medians.lock().await;
+    let mut markets: HashMap<String, Vec<WatchRule>> = HashMap::new();
+    for rule in rules.iter().filter(|rule| rule.rapid_monitor) {
+        markets.entry(format!("{}|{}", rule.region.to_ascii_uppercase(), rule.item_id))
+            .or_default().push(rule.clone());
+    }
+
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    let mut requests = 0;
+    let mut observed_lots = 0;
+    let mut new_lots = 0;
+    let mut rate_limit = None;
+    let mut rate_remaining = None;
+    let mut rate_reset_at = None;
+    let mut throttled = false;
+
+    for (market_key, market_rules) in markets {
+        if throttled { break; }
+        let mut request_rule = market_rules[0].clone();
+        request_rule.additional = market_rules.iter().any(|rule| rule.additional);
+        request_rule.rapid_limit = market_rules.iter().map(|rule| rule.rapid_limit).max().unwrap_or(5).clamp(1, 10);
+        let (response, rate) = request_recent_lots(&request_rule).await;
+        requests += 1;
+        if let Some(value) = rate.limit { rate_limit = Some(value); }
+        if let Some(value) = rate.remaining { rate_remaining = Some(rate_remaining.map_or(value, |current: u64| current.min(value))); }
+        if let Some(value) = rate.reset_at { rate_reset_at = Some(rate_reset_at.map_or(value, |current: i64| current.max(value))); }
+        if rate.remaining.is_some_and(|remaining| remaining <= 5) { throttled = true; }
+        let (_, lots) = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if error.contains("HTTP 429") { throttled = true; }
+                errors.push(format!("{}: {error}", market_key));
+                continue;
+            }
+        };
+        observed_lots += lots.len();
+        let keys = tracked_lot_keys(&request_rule, &lots);
+        let previous = seen_state.markets.get(&market_key).cloned().unwrap_or_default();
+        let (fresh, remembered) = update_rapid_keys(&previous, &keys, baseline);
+        new_lots += fresh.len();
+        seen_state.markets.insert(market_key, remembered);
+
+        for rule in &market_rules {
+            let mut rapid_rule = rule.clone();
+            rapid_rule.max_current_min_ratio = None;
+            let current: Vec<f64> = lots.iter().filter(|lot| variant_matches(&rapid_rule, lot))
+                .filter_map(|lot| unit_price(lot, "buyoutPrice")).collect();
+            let history_median = if rapid_rule.max_history_median_ratio.is_some() || rapid_rule.group_id.is_some() {
+                let key = rapid_median_key(&rapid_rule);
+                if let Some((cached_at, value)) = median_cache.get(&key)
+                    .filter(|(cached_at, _)| now.timestamp() - *cached_at < RAPID_MEDIAN_TTL_SECONDS) {
+                    let _ = cached_at;
+                    *value
+                } else {
+                    let history = load_cached_history_from(
+                        &connection, &rapid_rule.item_id, &rapid_rule.region.to_ascii_uppercase(),
+                        RAPID_HISTORY_DAYS, RAPID_HISTORY_LIMIT, now,
+                    )?;
+                    let values: Vec<f64> = history.iter().filter(|lot| variant_matches(&rapid_rule, lot))
+                        .filter_map(|lot| unit_price(lot, "price")).collect();
+                    let value = median(&values);
+                    median_cache.insert(key, (now.timestamp(), value));
+                    value
+                }
+            } else { None };
+            for (lot, key) in lots.iter().zip(keys.iter()) {
+                if !fresh.contains(key) || !lot_matches(&rapid_rule, lot, &current, history_median) { continue; }
+                let unit = unit_price(lot, "buyoutPrice");
+                matches.push(MatchRecord {
+                    name: rapid_rule.name.clone(), region: rapid_rule.region.clone(), item_id: rapid_rule.item_id.clone(),
+                    quality: lot_quality_code(lot).and_then(quality_label).map(str::to_string),
+                    upgrade: lot_upgrade(lot), amount: amount(lot),
+                    buyout: price(lot, "buyoutPrice").filter(|value| *value > 0), unit,
+                    current: price(lot, "currentPrice"), end: lot.get("endTime").and_then(Value::as_str).unwrap_or_default().into(),
+                    message: format!("Оперативный мониторинг\n{}", format_lot(&rapid_rule, lot)),
+                    deal_ratio: unit.zip(history_median).and_then(|(value, market)| (market > 0.0).then_some(value / market)),
+                    group_id: rapid_rule.group_id.clone(), group_top_n: rapid_rule.group_top_n,
+                    seen_key: key.clone(), is_new: true,
+                });
+            }
+        }
+    }
+
+    let mut individual = Vec::new();
+    let mut groups: HashMap<String, Vec<MatchRecord>> = HashMap::new();
+    for record in matches {
+        if let Some(group_id) = &record.group_id { groups.entry(group_id.clone()).or_default().push(record); }
+        else { individual.push(record); }
+    }
+    for mut records in groups.into_values() {
+        records.sort_by(|a, b| a.deal_ratio.unwrap_or(f64::INFINITY).total_cmp(&b.deal_ratio.unwrap_or(f64::INFINITY))
+            .then_with(|| a.unit.unwrap_or(f64::INFINITY).total_cmp(&b.unit.unwrap_or(f64::INFINITY))));
+        let top_n = records.first().and_then(|record| record.group_top_n).unwrap_or(1).clamp(1, 20);
+        individual.extend(records.into_iter().take(top_n));
+    }
+    for record in &individual { send_external_notifications(&record.message).await; }
+    seen_state.updated_at = Some(chrono::Utc::now().to_rfc3339());
+    fs::write(&state_path, serde_json::to_string_pretty(&seen_state).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+
+    Ok(RapidCheckResult {
+        checked_rules: rules.len(), requests, observed_lots, new_lots, baseline, throttled,
+        rate_limit, rate_remaining, rate_reset_at, errors, matches: individual,
+    })
+}
+
+#[tauri::command]
 async fn check_rules(
     rules: Vec<WatchRule>,
     notify_existing: bool,
@@ -1938,7 +2941,7 @@ async fn check_rules(
     for rule in &rules {
         let market_key = format!("{}|{}", rule.region.to_ascii_uppercase(), rule.item_id);
         if !collected_markets.contains_key(&market_key) {
-            let collection = match request_lots_for_collection(rule, 1_000).await {
+            let collection = match request_lots_for_collection(rule, 2_000).await {
                 Ok(collection) => collection,
                 Err(error) => {
                     collection_errors.push(format!("{} {}: {error}", rule.region.to_ascii_uppercase(), rule.item_id));
@@ -2052,8 +3055,12 @@ fn save_rules(payload: Value) -> Result<String, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .manage(AppState { check_lock: tokio::sync::Mutex::new(()) })
-        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, import_schistory_history, market_movement, market_timing, market_analytics, check_rules, load_rules, save_rules])
+        .manage(AppState {
+            check_lock: tokio::sync::Mutex::new(()),
+            rapid_lock: tokio::sync::Mutex::new(()),
+            rapid_medians: tokio::sync::Mutex::new(HashMap::new()),
+        })
+        .invoke_handler(tauri::generate_handler![credentials_status, cache_status, sync_market_cache, load_catalog, read_image, analyze_market, sales_history, import_schistory_history, market_movement, market_timing, market_analytics, market_deep_analysis, stack_strategy_analysis, ai_market_analysis, active_lots_for_rules, rapid_check_rules, check_rules, load_rules, save_rules])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }
@@ -2061,6 +3068,52 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_endpoint_accepts_local_and_remote_http_servers() {
+        assert!(ai_endpoint("http://localhost:11434/api/chat").is_ok());
+        assert!(ai_endpoint("http://[::1]:11434/api/chat").is_ok());
+        assert!(ai_endpoint("https://models.example.com/v1/chat/completions").is_ok());
+        assert!(ai_endpoint("ftp://models.example.com/model").is_err());
+        assert!(ai_endpoint("https://secret@models.example.com/v1/chat/completions").is_err());
+    }
+
+    #[test]
+    fn lm_studio_native_chat_endpoint_uses_openai_compatible_route() {
+        let url = normalized_ai_endpoint("http://192.168.1.116:1234/api/v1/chat")
+            .expect("valid LM Studio endpoint");
+        assert_eq!(url.as_str(), "http://192.168.1.116:1234/v1/chat/completions");
+    }
+
+    #[test]
+    fn ai_response_parser_accepts_structured_json_and_code_fence() {
+        let source = r#"```json
+        {"action":"Наблюдать","mainScenario":"Цена снизится","summary":"Вход только по условию","argumentsFor":["Есть скидка"],"argumentsAgainst":[],"entryConditions":["Минимум ниже"],"cancellationConditions":[],"missingData":["Глубина"]}
+        ```"#;
+        let analysis = parse_ai_market_analysis(source).expect("valid AI response");
+        assert_eq!(analysis.action, "Наблюдать");
+        assert_eq!(analysis.arguments_for, vec!["Есть скидка"]);
+        assert_eq!(analysis.missing_data, vec!["Глубина"]);
+    }
+
+    #[test]
+    fn ai_response_parser_repairs_only_trailing_commas() {
+        let source = r#"{
+          "action":"Ждать",
+          "mainScenario":"Коррекция",
+          "summary":"Цена входа высока",
+          "argumentsFor":["Высокая ликвидность",],
+          "argumentsAgainst":["Отрицательный ROI",],
+          "entryConditions":[],
+          "cancellationConditions":[],
+          "missingData":[],
+        }"#;
+        let analysis = parse_ai_market_analysis(source).expect("repairable AI response");
+        assert_eq!(analysis.action, "Ждать");
+        assert_eq!(analysis.arguments_for, vec!["Высокая ликвидность"]);
+        assert_eq!(analysis.arguments_against, vec!["Отрицательный ROI"]);
+        assert_eq!(remove_trailing_json_commas(r#"{"text":"keep,]"}"#), r#"{"text":"keep,]"}"#);
+    }
 
     fn rule_with_quality(quality: &str) -> WatchRule {
         serde_json::from_value(json!({
@@ -2083,6 +3136,20 @@ mod tests {
     fn zero_buyout_is_not_a_market_price() {
         let lot = json!({"amount": 1, "buyoutPrice": 0});
         assert_eq!(unit_price(&lot, "buyoutPrice"), None);
+    }
+
+    #[test]
+    fn rule_amount_range_and_comparison_bands_are_stable() {
+        let rule: WatchRule = serde_json::from_value(json!({
+            "name": "tools", "itemId": "tools", "region": "RU", "minAmount": 5, "maxAmount": 9
+        })).unwrap();
+        assert!(!variant_matches(&rule, &json!({"amount": 4})));
+        assert!(variant_matches(&rule, &json!({"amount": 6})));
+        assert!(!variant_matches(&rule, &json!({"amount": 10})));
+        assert_eq!(amount_band(1), (1, 1, "1 шт."));
+        assert_eq!(amount_band(6), (5, 9, "5–9 шт."));
+        assert_eq!(amount_band(20), (20, 49, "20–49 шт."));
+        assert_eq!(amount_band(100).2, "50+ шт.");
     }
 
     #[test]
@@ -2194,15 +3261,80 @@ mod tests {
                 params![fingerprint, now.to_rfc3339(), now.timestamp(), price, quality]
             ).unwrap();
         }
+        connection.execute(
+            "INSERT INTO sales
+             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json, source, source_id)
+             VALUES ('special-history', 'artifact', 'RU', ?1, ?2, 1, 115, 2, 15, '{}', 'schistory', 'ru:42')",
+            params![now.to_rfc3339(), now.timestamp()]
+        ).unwrap();
 
-        let filters = MovementFilters { quality_mask: 1 << 2, min_upgrade: Some(15), max_upgrade: Some(15) };
+        let filters = MovementFilters {
+            quality_mask: 1 << 2,
+            min_upgrade: Some(15),
+            max_upgrade: Some(15),
+            min_amount: None,
+            max_amount: None,
+        };
         let response = market_movement_from(&connection, 24, "RU".into(), filters, now).expect("filtered movement");
         let market = &response.markets[0];
         assert_eq!(market.current_supply, 1);
         assert_eq!(market.current_median_unit, Some(120.0));
-        assert_eq!(market.official_sales, 1);
+        assert_eq!(market.recorded_sales, 2);
+        assert_eq!(market.schistory_sales, 1);
+        assert_eq!(market.stalzone_sales, 1);
+        assert_eq!(market.sale_points.len(), 1);
+        assert_eq!(market.sale_points[0].median_unit, 117.5);
         assert_eq!(market.active_lots, 2);
         assert!(market.events.iter().all(|event| event.quality.as_deref() == Some("Особый") && event.upgrade == Some(15)));
+    }
+
+    #[test]
+    fn movement_filters_stack_size_across_offers_and_sales() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (pass, timestamp) in [now.timestamp() - 3_600, now.timestamp()].into_iter().enumerate() {
+            connection.execute(
+                "INSERT INTO market_collections
+                 (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+                 VALUES (?1, ?2, 'tools', 'RU', 2, 2, 1)",
+                params![chrono::DateTime::from_timestamp(timestamp, 0).unwrap().to_rfc3339(), timestamp]
+            ).unwrap();
+            let collection_id = connection.last_insert_rowid();
+            for (suffix, amount, unit) in [("single", 1, 100), ("bulk", 20, 600)] {
+                let lot_key = format!("{pass}-{suffix}");
+                connection.execute(
+                    "INSERT INTO tracked_lots
+                     (lot_key, item_id, region, first_seen_at, first_seen_timestamp, last_seen_at, last_seen_timestamp,
+                      status, observation_count, amount, buyout_price, raw_json)
+                     VALUES (?1, 'tools', 'RU', ?2, ?3, ?2, ?3, 'active', 1, ?4, ?5, '{}')",
+                    params![&lot_key, chrono::DateTime::from_timestamp(timestamp, 0).unwrap().to_rfc3339(), timestamp, amount, amount * unit]
+                ).unwrap();
+                connection.execute(
+                    "INSERT INTO lot_observations
+                     (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                     VALUES (?1, ?2, 'tools', 'RU', ?3, ?4, '{}')",
+                    params![collection_id, &lot_key, amount, amount * unit]
+                ).unwrap();
+            }
+        }
+        for (fingerprint, amount, unit) in [("single-sale", 1, 100), ("bulk-sale", 20, 550)] {
+            connection.execute(
+                "INSERT INTO sales
+                 (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, raw_json)
+                 VALUES (?1, 'tools', 'RU', ?2, ?3, ?4, ?5, '{}')",
+                params![fingerprint, now.to_rfc3339(), now.timestamp(), amount, amount * unit]
+            ).unwrap();
+        }
+
+        let filters = MovementFilters { min_amount: Some(20), max_amount: Some(49), ..MovementFilters::default() };
+        let response = market_movement_from(&connection, 24, "RU".into(), filters, now).expect("stack movement");
+        let market = &response.markets[0];
+        assert_eq!(market.current_supply, 1);
+        assert_eq!(market.current_median_unit, Some(600.0));
+        assert_eq!(market.recorded_sales, 1);
+        assert_eq!(market.sale_points[0].median_unit, 550.0);
+        assert!(market.events.iter().all(|event| event.amount == 20));
     }
 
     #[test]
@@ -2287,7 +3419,124 @@ mod tests {
     }
 
     #[test]
-    fn missing_lot_matches_one_official_sale_with_confidence() {
+    fn stack_strategy_combines_small_lots_and_values_bulk_resale() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T08:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        connection.execute(
+            "INSERT INTO market_collections
+             (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+             VALUES (?1, ?2, 'tools', 'RU', 20, 20, 1)",
+            params![now.to_rfc3339(), now.timestamp()]
+        ).unwrap();
+        let collection_id = connection.last_insert_rowid();
+        for index in 0..20 {
+            let raw = json!({"amount": 1, "buyoutPrice": 46_000});
+            connection.execute(
+                "INSERT INTO lot_observations
+                 (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                 VALUES (?1, ?2, 'tools', 'RU', 1, 46000, ?3)",
+                params![collection_id, format!("small-{index}"), raw.to_string()]
+            ).unwrap();
+        }
+        for index in 0..8 {
+            let sold_at = (now - chrono::Duration::hours(index)).to_rfc3339();
+            let raw = json!({"amount": 20, "price": 1_200_000, "time": sold_at});
+            connection.execute(
+                "INSERT INTO sales
+                 (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, raw_json)
+                 VALUES (?1, 'tools', 'RU', ?2, ?3, 20, 1200000, ?4)",
+                params![format!("bulk-{index}"), sold_at, now.timestamp() - index * 3_600, raw.to_string()]
+            ).unwrap();
+        }
+        let rule: WatchRule = serde_json::from_value(json!({"name":"tools","itemId":"tools","region":"RU"})).unwrap();
+        let analysis = stack_strategy_from(&connection, &rule, 1, 20, 20, 5.0, None, now).expect("stack strategy");
+        assert!(analysis.complete);
+        assert_eq!(analysis.acquired_amount, 20);
+        assert_eq!(analysis.purchase_lots, 20);
+        assert_eq!(analysis.average_buy_unit, Some(46_000.0));
+        assert_eq!(analysis.recent_bulk_median_unit, Some(60_000.0));
+        assert!(analysis.roi_percent.is_some_and(|roi| roi > 20.0));
+    }
+
+    #[test]
+    fn active_lot_view_uses_latest_snapshot_and_rule_match() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T08:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (offset, price) in [(60, 10_i64), (0, 40_i64)] {
+            let collected = now - chrono::Duration::minutes(offset);
+            connection.execute(
+                "INSERT INTO market_collections
+                 (collected_at, collected_timestamp, item_id, region, api_total, returned_lots, complete)
+                 VALUES (?1, ?2, 'tools', 'RU', 2, 2, 1)",
+                params![collected.to_rfc3339(), collected.timestamp()]
+            ).unwrap();
+            let collection_id = connection.last_insert_rowid();
+            let raw = json!({"amount": 1, "buyoutPrice": price, "endTime": "2026-07-04T08:00:00Z"});
+            connection.execute(
+                "INSERT INTO lot_observations
+                 (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                 VALUES (?1, ?2, 'tools', 'RU', 1, ?3, ?4)",
+                params![collection_id, format!("snapshot-{offset}"), price, raw.to_string()]
+            ).unwrap();
+            if offset == 0 {
+                let expensive = json!({"amount": 10, "buyoutPrice": 600});
+                connection.execute(
+                    "INSERT INTO lot_observations
+                     (collection_id, lot_key, item_id, region, amount, buyout_price, raw_json)
+                     VALUES (?1, 'latest-expensive', 'tools', 'RU', 10, 600, ?2)",
+                    params![collection_id, expensive.to_string()]
+                ).unwrap();
+            }
+        }
+        let rule: WatchRule = serde_json::from_value(json!({
+            "name":"tools", "itemId":"tools", "region":"RU", "maxUnitBuyout":50
+        })).unwrap();
+        let response = active_lots_for_rules_from(&connection, &[rule], 100, now).expect("active lots");
+        assert_eq!(response.total, 2);
+        assert_eq!(response.lots[0].unit_price, Some(40.0));
+        assert!(response.lots[0].matches_rule);
+        assert_eq!(response.lots[1].unit_price, Some(60.0));
+        assert!(!response.lots[1].matches_rule);
+    }
+
+    #[test]
+    fn rapid_monitor_baselines_then_detects_only_new_keys() {
+        let first = vec!["lot-a".to_string(), "lot-b".to_string()];
+        let (baseline_fresh, remembered) = update_rapid_keys(&[], &first, true);
+        assert!(baseline_fresh.is_empty());
+        assert_eq!(remembered, first);
+
+        let next = vec!["lot-c".to_string(), "lot-a".to_string()];
+        let (fresh, remembered) = update_rapid_keys(&remembered, &next, false);
+        assert_eq!(fresh, HashSet::from(["lot-c".to_string()]));
+        assert_eq!(remembered, vec!["lot-c", "lot-a", "lot-b"]);
+
+        let (repeated, _) = update_rapid_keys(&remembered, &next, false);
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn rapid_monitor_rule_defaults_are_conservative() {
+        let rule: WatchRule = serde_json::from_value(json!({"name":"item","itemId":"id","region":"RU"})).unwrap();
+        assert!(!rule.rapid_monitor);
+        assert_eq!(rule.rapid_interval_seconds, 5);
+        assert_eq!(rule.rapid_limit, 5);
+    }
+
+    #[test]
+    fn stackability_requires_observed_multi_item_lot() {
+        assert_eq!(infer_stackability(&[1, 1, 1]).0, "unknown");
+        assert_eq!(infer_stackability(&vec![1; 20]).0, "single");
+        let stackable = infer_stackability(&[1, 1, 20]);
+        assert_eq!(stackable.0, "stackable");
+        assert_eq!(stackable.1, 1);
+        assert_eq!(stackable.2, 20);
+    }
+
+    #[test]
+    fn missing_lot_matches_one_schistory_sale_with_confidence() {
         let mut connection = Connection::open_in_memory().expect("in-memory cache");
         prepare_cache(&connection).expect("cache schema");
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
@@ -2305,8 +3554,8 @@ mod tests {
         ).unwrap();
         connection.execute(
             "INSERT INTO sales
-             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json)
-             VALUES ('sale', 'item', 'RU', ?1, ?2, 1, 100, 2, 15, '{}')",
+             (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, quality_code, upgrade, raw_json, source, source_id)
+             VALUES ('sale', 'item', 'RU', ?1, ?2, 1, 100, 2, 15, '{}', 'schistory', 'ru:99')",
             params![(now - chrono::Duration::seconds(30)).to_rfc3339(), now.timestamp() - 30]
         ).unwrap();
 
@@ -2315,6 +3564,34 @@ mod tests {
         let confidence: f64 = connection.query_row("SELECT confidence FROM lot_sale_matches WHERE lot_key = 'lot'", [], |row| row.get(0)).unwrap();
         assert_eq!(status, "probable_sold");
         assert!(confidence >= 0.95);
+    }
+
+    #[test]
+    fn analytics_history_includes_long_schistory_records() {
+        let connection = Connection::open_in_memory().expect("in-memory cache");
+        prepare_cache(&connection).expect("cache schema");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T08:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (id, age_days) in [("within-window", 180), ("outside-window", 401)] {
+            let sold_at = now - chrono::Duration::days(age_days);
+            let raw = json!({
+                "amount": 1,
+                "price": 50_000,
+                "time": sold_at.to_rfc3339(),
+                "_source": "schistory"
+            });
+            connection.execute(
+                "INSERT INTO sales
+                 (fingerprint, item_id, region, sold_at, sold_timestamp, amount, price, raw_json, source, source_id)
+                 VALUES (?1, 'tools', 'RU', ?2, ?3, 1, 50000, ?4, 'schistory', ?5)",
+                params![id, sold_at.to_rfc3339(), sold_at.timestamp(), raw.to_string(), format!("ru:{id}")]
+            ).unwrap();
+        }
+
+        let history = load_cached_history_from(
+            &connection, "tools", "RU", ANALYTICS_HISTORY_DAYS, ANALYTICS_HISTORY_LIMIT, now,
+        ).expect("analytics history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].get("_source").and_then(Value::as_str), Some("schistory"));
     }
 
     #[test]

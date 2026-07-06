@@ -3,15 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { ColorType, createChart, LineSeries, type IChartApi, type UTCTimestamp } from "lightweight-charts";
 import {
-  Activity, BadgeDollarSign, BarChart3, Bell, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, createIcons,
+  Activity, BadgeDollarSign, BarChart3, Bell, BellPlus, ChartNoAxesCombined, Check, ChevronRight, CircleHelp, Clock3, Coins, createIcons,
   ChartLine, CircleDollarSign, Database, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
-  Hand, Hourglass, RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, ShoppingCart, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, TriangleAlert, X,
+  Hand, Hourglass, ListChecks, RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, ShoppingCart, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, TriangleAlert, X, Zap,
 } from "lucide";
 
 const appIcons = {
-  Activity, BadgeDollarSign, BarChart3, Bell, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, Database,
-  CircleDollarSign, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
-  Hand, Hourglass, RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, ShoppingCart, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, TriangleAlert, X,
+  Activity, BadgeDollarSign, BarChart3, Bell, BellPlus, ChartLine, ChartNoAxesCombined, Check, ChevronRight, Clock3, Coins, Database,
+  CircleDollarSign, CircleHelp, DatabaseZap, Gauge, Gem, History, KeyRound, LayoutDashboard, Pencil, Play, Plus, RefreshCw,
+  Hand, Hourglass, ListChecks, RotateCcw, Save, Search, SearchX, ShieldAlert, ShieldCheck, ShoppingCart, SlidersHorizontal, Sparkles, Square, Table2, TrendingUp, Trash2, TriangleAlert, X, Zap,
 };
 
 type CatalogItem = {
@@ -38,6 +38,7 @@ type Rule = {
   maxCurrentMinRatio?: number;
   historyLimit?: number;
   minAmount?: number;
+  maxAmount?: number;
   artifactQualities?: ArtifactQuality[];
   minTier?: number;
   maxTier?: number;
@@ -49,6 +50,9 @@ type Rule = {
   additional?: boolean;
   groupId?: string;
   groupTopN?: number;
+  rapidMonitor?: boolean;
+  rapidIntervalSeconds?: number;
+  rapidLimit?: number;
 };
 
 type MatchRecord = {
@@ -78,45 +82,91 @@ type RuleSummary = {
   historyMedianUnit?: number;
   checkedAt: string;
 };
+type ActiveLotView = {
+  itemId: string; amount: number; buyout?: number; unitPrice?: number; currentPrice?: number;
+  quality?: string; upgrade?: number; startTime?: string; endTime?: string; matchesRule: boolean;
+};
+type ActiveLotsResponse = {
+  total: number; returned: number; markets: number; completeMarkets: number;
+  collectedAt?: string; lots: ActiveLotView[];
+};
 
 type CheckResult = { checkedRules: number; notifications: number; observedLots: number; collectedSales: number; collectionErrors: string[]; matches: MatchRecord[]; summaries: RuleSummary[] };
+type RapidCheckResult = {
+  checkedRules: number; requests: number; observedLots: number; newLots: number; baseline: boolean;
+  throttled: boolean; rateLimit?: number; rateRemaining?: number; rateResetAt?: number;
+  errors: string[]; matches: MatchRecord[];
+};
 type MarketAnalysis = { lots: number; history: number; currentMin?: number; currentMedian?: number; historyMedian?: number };
 type SalesHistoryEntry = { amount: number; price: number; unitPrice: number; time: string; quality?: string; qualityCode?: number; upgrade?: number; source: string };
 type SalesHistoryResponse = { total: number; entries: SalesHistoryEntry[] };
 type SchistoryImportResponse = { externalItemId: number; fetchedSales: number; matchingSales: number; insertedSales: number; skippedExisting: number; oldestSale?: string; newestSale?: string };
 type MarketInsight = {
   name: string; itemId: string; region: string; activeLots: number; matchingLots: number;
-  artifactQualities: ArtifactQuality[]; minUpgrade?: number; maxUpgrade?: number;
+  allActiveLots: number; currentMinAmount?: number; comparisonAmountLabel: string;
+  comparisonAmountMin: number; comparisonAmountMax?: number;
+  stackability: "stackable" | "single" | "unknown"; stackEvidence: number; maxObservedAmount: number;
+  artifactQualities: ArtifactQuality[]; minAmount?: number; minUpgrade?: number; maxUpgrade?: number;
   salesSample: number; soldAmount: number; currentMinUnit?: number; medianUnit?: number;
   fairValueUnit?: number; recentMedianUnit?: number; recentP25Unit?: number; recentP75Unit?: number;
   recentSalesSample: number; latestSaleUnit?: number; latestSaleAt?: string;
   averageUnit?: number; p25Unit?: number; p75Unit?: number; discountPercent?: number;
   trendPercent?: number; volatilityPercent?: number; salesPerDay?: number;
   averageSaleIntervalMinutes?: number; opportunityScore: number; liquidity: string;
+  movementSupplyChangePercent?: number; movementPriceChangePercent?: number;
+  movementCollections: number; movementCoveragePercent: number;
   verdict: string; risks: string[];
 };
 type MarketAnalyticsResponse = { generatedAt: string; insights: MarketInsight[] };
 type TimingBucket = { key: number; medianMinUnit: number; samples: number; discountPercent: number };
 type MarketTimingResponse = { periodDays: number; totalSamples: number; overallMedianMin?: number; hourWindows: TimingBucket[]; weekdays: TimingBucket[] };
+type DeepPriceWindow = { hours: number; sales: number; units: number; p25Unit?: number; medianUnit?: number; p75Unit?: number };
+type DeepStackSegment = { label: string; sales: number; units: number; medianUnit?: number };
+type MarketDepthLevel = { price: number; lots: number; units: number };
+type MarketDeepAnalysis = {
+  generatedAt: string; historyHours: number; totalSales: number; soldUnits: number;
+  collections: number; completeCollections: number; currentSupply: number; currentUnits: number;
+  currentMinUnit?: number; currentMedianUnit?: number; supplyChangePercent?: number;
+  expectedSellUnit?: number; buyForFivePercent?: number; buyForTenPercent?: number;
+  windows: DeepPriceWindow[]; stackSegments: DeepStackSegment[]; depth: MarketDepthLevel[]; insights: string[];
+};
+type StackStrategyAnalysis = {
+  buyMaxAmount: number; sellMinAmount: number; targetAmount: number; acquiredAmount: number;
+  purchaseLots: number; availableLots: number; availableUnits: number; totalCost: number;
+  averageBuyUnit?: number; cheapestBuyUnit?: number; expectedSellUnit?: number;
+  recentBulkMedianUnit?: number; bulkSalesSample: number; netRevenue?: number; profit?: number;
+  roiPercent?: number; breakEvenBuyUnit?: number; complete: boolean; warnings: string[];
+};
 type MovementPoint = { time: number; supply: number; minUnit?: number; medianUnit?: number };
+type MovementSalePoint = { time: number; medianUnit: number; sales: number; units: number };
 type MovementEvent = { kind: "appeared" | "missing" | "ended" | "probable_sale"; time: string; amount: number; buyout?: number; unitPrice?: number; quality?: string; upgrade?: number; lifetimeMinutes?: number; confidence?: number };
 type MarketMovement = {
   itemId: string; region: string; currentSupply: number; supplyChangePercent?: number;
   currentMinUnit?: number; currentMedianUnit?: number; priceChangePercent?: number;
-  appeared: number; disappeared: number; officialSales: number; probableSales: number; unexplainedMissing: number; ended: number; activeLots: number;
+  appeared: number; disappeared: number; recordedSales: number; schistorySales: number; stalzoneSales: number;
+  probableSales: number; unexplainedMissing: number; ended: number; activeLots: number;
   averageLifetimeMinutes?: number; collections: number; coveragePercent: number;
-  lastCollected: string; signal: string; points: MovementPoint[]; events: MovementEvent[];
+  lastCollected: string; signal: string; points: MovementPoint[]; salePoints: MovementSalePoint[]; events: MovementEvent[];
 };
 type MarketMovementResponse = { generatedAt: string; hours: number; markets: MarketMovement[] };
 type MarketOpportunity = {
   insight: MarketInsight; score: number; buyPrice: number; expectedSellPrice: number;
   netSellPrice: number; profitPerUnit: number; roiPercent: number; sellThroughPercent: number;
   confidencePercent: number; confidence: "Высокая" | "Средняя" | "Низкая"; warnings: string[];
+  mode: "comparable" | "stack"; purchaseAmount: number; purchaseLots: number;
+  sellAmountLabel: string; stackStrategy?: StackStrategyAnalysis;
+};
+type AiMarketAnalysis = {
+  action: string; mainScenario: string; summary: string;
+  argumentsFor: string[]; argumentsAgainst: string[];
+  entryConditions: string[]; cancellationConditions: string[]; missingData: string[];
 };
 type RecommendationAction = "buy" | "sell" | "wait" | "hold" | "risk";
 type MarketRecommendation = {
   insight: MarketInsight; action: RecommendationAction; title: string; summary: string;
-  reasons: string[]; targetLow?: number; targetHigh?: number; confidence: "Высокая" | "Средняя" | "Низкая";
+  reasons: string[]; buyerAction: string; ownerAction: string; decisionStrength: number;
+  currentBuyUnit?: number; marketReferenceUnit?: number; contextLabel: string; decisionRoi?: number; dataSample: number;
+  targetLow?: number; targetHigh?: number; dataQuality: "Высокое" | "Среднее" | "Низкое";
 };
 type CacheStatus = {
   sales: number; snapshots: number; items: number; collections: number; lotObservations: number;
@@ -133,6 +183,32 @@ const artifactQualities: { value: ArtifactQuality; label: string }[] = [
   { value: "exceptional", label: "Исключительный" },
   { value: "legendary", label: "Легендарный" },
 ];
+
+const escapeHtml = (text: string) => text.replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]!);
+const helpTip = (text: string, label = "Пояснение") => `<button class="metric-help" type="button" data-help="${escapeHtml(text)}" aria-label="${escapeHtml(label)}"><i data-lucide="circle-help"></i></button>`;
+
+const helpText = {
+  coverage: "Доля снимков, в которых приложение получило весь рынок целиком. Только полный обход позволяет надёжно утверждать, что лот исчез. При покрытии ниже 80% осторожнее интерпретируйте исчезновения и время жизни.",
+  supply: "Количество активных лотов в последнем полном снимке. Процент показывает изменение от первого до последнего снимка выбранного периода.",
+  askMedian: "Медианная цена за штуку среди активных предложений. Это ожидания продавцов, а не цена состоявшейся сделки.",
+  askMinimum: "Самое дешёвое активное предложение за штуку в последнем полном снимке. Число проходов показывает, сколько раз рынок был сохранён за выбранный период.",
+  lifetime: "Среднее время между первым появлением лота и его исчезновением или завершением. Исчезновение не всегда означает продажу.",
+  recordedSales: "Подтверждённые записи продаж из STALZONE API и SCHistory API после удаления дублей. Оба источника имеют одинаковый вес.",
+  probableSales: "Исчезнувшие лоты, для которых найдена близкая продажа по времени, цене, количеству, качеству и заточке. Связь вероятная, потому что API не даёт общего lotId.",
+  missing: "Лоты исчезли после полного обхода, но не были уверенно сопоставлены с продажей. Их могли купить, снять с аукциона или завершить другим способом.",
+  opportunityScore: "Сводная оценка 0–100. Учитывает потенциальную доходность, вероятность реализации, устойчивость цены и качество данных. Это способ ранжирования, а не гарантия прибыли.",
+  adaptivePrice: "Оценка актуального уровня продажи. Свежая медиана имеет приоритет, а при малой выборке смешивается с длинной историей.",
+  deviation: "Насколько текущий минимум дешевле адаптивной цены. Положительное значение означает скидку, отрицательное — переплату.",
+  percentile: "P25 — цена, ниже которой прошла четверть продаж; P75 — цена, ниже которой прошли три четверти. P25 полезен как ориентир выгодной покупки.",
+  trend: "Изменение медианы подтверждённых продаж последних 24 часов относительно предыдущих 24 часов.",
+  volatility: "Ширина диапазона P25–P75 недавних продаж относительно медианы. Чем больше значение, тем менее предсказуема цена.",
+  salesPerDay: "Средняя частота подтверждённых продаж в доступной истории. Она оценивает ликвидность, но не гарантирует продажу по вашей цене.",
+  freshSample: "Количество подтверждённых продаж в свежем 24-часовом окне. Чем меньше выборка, тем сильнее расчёт опирается на длинную историю.",
+  matchingLots: "Первое число — все активные лоты нужного варианта; второе — лоты, прошедшие ценовые и относительные ограничения правила.",
+  expectedSale: "Консервативная цена выхода: адаптивная цена уменьшается с учётом разброса и отрицательного тренда.",
+  sellThrough: "Модельная вероятность реализации за выбранный срок. Рассчитывается по частоте продаж относительно числа активных лотов и не учитывает вашу позицию в очереди продавцов.",
+  confidence: "Качество исходных данных: объём истории, полнота обходов и число снимков. Высокая уверенность не означает гарантированную прибыль.",
+};
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
@@ -169,8 +245,7 @@ app.innerHTML = `
         <button class="active" data-view="overview"><i data-lucide="layout-dashboard"></i> Обзор рынка</button>
         <button data-view="config"><i data-lucide="sliders-horizontal"></i> Правила и фильтры</button>
         <button data-view="history"><i data-lucide="history"></i> История продаж</button>
-        <button data-view="analytics"><i data-lucide="sparkles"></i> Аналитика</button>
-        <button data-view="scanner"><i data-lucide="circle-dollar-sign"></i> Сканер</button>
+        <button data-view="analytics"><i data-lucide="sparkles"></i> Рыночный советник</button>
         <button data-view="movement"><i data-lucide="activity"></i> Движение рынка</button>
       </nav>
 
@@ -212,10 +287,11 @@ app.innerHTML = `
 
         <div class="filter-section">
           <div class="filter-title"><i data-lucide="coins"></i><div><strong>Цена и количество</strong><span>Достаточно одного лимита, остальные можно оставить пустыми</span></div></div>
-          <div class="filter-grid three">
-            <label title="Максимальная цена выкупа всего лота"><span>Выкуп всего, до</span><div class="money-input"><input id="max-buyout" type="number" min="0" placeholder="Без лимита" /><b>₽</b></div></label>
-            <label title="Выкуп, делённый на количество предметов"><span>Цена за штуку, до</span><div class="money-input"><input id="max-unit" type="number" min="0" placeholder="Без лимита" /><b>₽</b></div></label>
-            <label title="Минимально допустимое количество в лоте"><span>Количество, от</span><input id="min-amount" type="number" min="1" placeholder="Любое" /></label>
+          <div class="filter-grid four">
+            <label><span>Выкуп всего, до ${helpTip("Жёсткий предел полной стоимости лота независимо от количества предметов внутри.")}</span><div class="money-input"><input id="max-buyout" type="number" min="0" placeholder="Без лимита" /><b>₽</b></div></label>
+            <label><span>Цена за штуку, до ${helpTip("Полная цена выкупа делится на количество в лоте. Для одиночного артефакта совпадает с ценой всего лота.")}</span><div class="money-input"><input id="max-unit" type="number" min="0" placeholder="Без лимита" /><b>₽</b></div></label>
+            <label><span>Количество, от ${helpTip("Лоты с меньшим количеством не пройдут правило. Оставьте пустым, если размер лота не важен.")}</span><input id="min-amount" type="number" min="1" placeholder="Любое" /></label>
+            <label><span>Количество, до ${helpTip("Лоты с большим количеством не пройдут правило. Вместе с нижней границей позволяет выделить сопоставимый размер пачки.")}</span><input id="max-amount" type="number" min="1" placeholder="Любое" /></label>
           </div>
         </div>
 
@@ -232,10 +308,19 @@ app.innerHTML = `
         <div class="filter-section">
           <div class="filter-title"><i data-lucide="chart-no-axes-combined"></i><div><strong>Относительная выгода</strong><span>Процент от ориентира: 90% означает примерно на 10% дешевле</span></div></div>
           <div class="filter-grid two">
-            <label title="Сравнение с медианой уже проданных лотов"><span>Не дороже медианы продаж</span><div class="percent-input"><input id="history-percent" type="number" min="1" max="200" placeholder="Не учитывать" /><b>%</b></div></label>
-            <label title="Сравнение со следующим самым дешёвым активным лотом"><span>Не дороже текущего минимума</span><div class="percent-input"><input id="current-percent" type="number" min="1" max="200" placeholder="Не учитывать" /><b>%</b></div></label>
+            <label><span>Не дороже медианы продаж ${helpTip("100% — не выше медианы подтверждённых продаж; 90% — минимум на 10% дешевле неё. Сравниваются только тот же регион и вариант предмета.")}</span><div class="percent-input"><input id="history-percent" type="number" min="1" max="200" placeholder="Не учитывать" /><b>%</b></div></label>
+            <label><span>Не дороже текущего минимума ${helpTip("Сравнение со следующим самым дешёвым активным лотом. 90% требует скидку минимум 10% к конкурентному предложению.")}</span><div class="percent-input"><input id="current-percent" type="number" min="1" max="200" placeholder="Не учитывать" /><b>%</b></div></label>
           </div>
           <div class="presets"><span>Быстрый выбор</span><button data-preset="safe">95% рынка</button><button data-preset="deal">90% медианы</button><button data-preset="snipe">80% медианы</button></div>
+        </div>
+
+        <div class="filter-section rapid-rule-section">
+          <div class="rapid-rule-head"><div><i data-lucide="zap"></i><div><strong>Оперативный мониторинг</strong><span>Проверяет только последние 5 предложений и сразу сообщает о выгодном новом лоте</span></div></div><label class="switch-control"><input id="rapid-monitor" type="checkbox" /><span></span></label></div>
+          <div id="rapid-settings" class="rapid-settings hidden">
+            <label><span>Интервал опроса</span><div class="rapid-slider"><input id="rapid-interval" type="range" min="3" max="10" step="1" value="5" /><output id="rapid-interval-value">5 сек</output></div></label>
+            <div class="rapid-budget"><i data-lucide="gauge"></i><div><strong id="rapid-budget-title">До 1 запроса каждые 5 секунд</strong><span id="rapid-budget-note">API опрашивается отдельно для каждого выбранного предмета</span></div></div>
+          </div>
+          <div id="rapid-warning" class="rapid-warning hidden"><i data-lucide="triangle-alert"></i><span>Сравнение с текущим минимумом отключено: последние лоты не являются полной выборкой рынка.</span></div>
         </div>
 
         <div class="editor-actions"><button id="analyze" class="secondary"><i data-lucide="bar-chart-3"></i> Анализ рынка</button><button id="upsert" class="primary"><i data-lucide="check"></i> Добавить правило</button></div>
@@ -269,11 +354,11 @@ app.innerHTML = `
           <div class="history-upgrade"><span>Заточка</span><input id="history-min-upgrade" type="number" min="0" max="15" placeholder="от" /><b>—</b><input id="history-max-upgrade" type="number" min="0" max="15" placeholder="до" /></div>
         </section>
         <section class="history-stats">
-          <div><span>Всего продаж</span><strong id="history-total">—</strong></div>
-          <div><span>В выборке</span><strong id="history-count">—</strong></div>
-          <div><span>Минимум</span><strong id="history-min">—</strong></div>
-          <div><span>Медиана</span><strong id="history-median">—</strong></div>
-          <div><span>Средняя</span><strong id="history-average">—</strong></div>
+          <div><span>Всего продаж ${helpTip("Количество записей выбранного предмета у источника до применения экранных фильтров.")}</span><strong id="history-total">—</strong></div>
+          <div><span>В выборке ${helpTip("Продажи, оставшиеся после фильтров количества, качества и заточки. Именно по ним рассчитаны показатели ниже.")}</span><strong id="history-count">—</strong></div>
+          <div><span>Минимум ${helpTip("Самая низкая цена в выборке. Может быть единичным выбросом и сама по себе не является справедливой ценой.")}</span><strong id="history-min">—</strong></div>
+          <div><span>Медиана ${helpTip("Середина отсортированных цен: половина продаж дешевле, половина дороже. Обычно устойчивее среднего к ошибочным и экстремальным сделкам.")}</span><strong id="history-median">—</strong></div>
+          <div><span>Средняя ${helpTip("Сумма цен, делённая на число продаж. Сильно реагирует на очень дорогие или дешёвые сделки.")}</span><strong id="history-average">—</strong></div>
         </section>
         <section id="history-chart-wrap" class="history-data"><div id="history-legend" class="history-legend"></div><div id="history-chart"></div><div id="history-chart-empty" class="history-empty">Выберите предмет и загрузите продажи</div></section>
         <section id="history-table-wrap" class="history-data hidden"><div class="history-table-scroll"><table><thead><tr><th>Время</th><th class="history-quality-column">Редкость</th><th class="history-quality-column">Заточка</th><th>Источник</th><th>Количество</th><th>За лот</th><th>За штуку</th></tr></thead><tbody id="history-table-body"></tbody></table></div></section>
@@ -282,53 +367,59 @@ app.innerHTML = `
 
       <div id="analytics-view" class="workspace-view hidden">
         <section class="analytics-head">
-          <div><span class="eyebrow">Рыночные сигналы</span><h2>Полезная аналитика</h2><small id="analytics-updated">Используются предметы из активных правил</small></div>
-          <button id="analytics-load" class="primary"><i data-lucide="refresh-cw"></i> Рассчитать</button>
+          <div><span class="eyebrow">Решения на основе рынка</span><h2>Рыночный советник</h2><small id="analytics-updated">Один расчёт для рекомендаций, сделок и метрик</small></div>
+          <button id="analytics-load" class="primary"><i data-lucide="refresh-cw"></i> Обновить советник</button>
         </section>
         <section class="cache-strip" id="cache-strip" title="Локальный рыночный архив">
           <i data-lucide="database"></i><div><strong id="cache-summary">Локальная база подготавливается</strong><span id="cache-range">Продажи будут накапливаться автоматически</span></div>
           <small id="cache-size">—</small>
         </section>
+        <nav class="advisor-tabs" aria-label="Разделы рыночного советника"><button class="active" data-advisor="decisions"><i data-lucide="sparkles"></i> Что делать</button><button data-advisor="deals"><i data-lucide="circle-dollar-sign"></i> Сделки</button><button data-advisor="metrics"><i data-lucide="bar-chart-3"></i> Метрики</button></nav>
+        <div id="advisor-decisions-panel" class="advisor-panel">
         <section class="analytics-stats">
-          <div><i data-lucide="sparkles"></i><span>Лучший сигнал</span><strong id="analytics-best">—</strong><small id="analytics-best-name">нет расчёта</small></div>
-          <div><i data-lucide="circle-dollar-sign"></i><span>Средняя скидка</span><strong id="analytics-discount">—</strong><small>к медиане продаж</small></div>
-          <div><i data-lucide="trending-up"></i><span>Ликвидных рынков</span><strong id="analytics-liquid">—</strong><small>высокая скорость продаж</small></div>
-          <div><i data-lucide="gauge"></i><span>Подходящих лотов</span><strong id="analytics-matches">—</strong><small>по активным правилам</small></div>
+          <div><i data-lucide="list-checks"></i><span>Проанализировано</span><strong id="analytics-best">—</strong><small id="analytics-best-name">вариантов рынка</small></div>
+          <div><i data-lucide="shopping-cart"></i><span>Покупать</span><strong id="analytics-discount">—</strong><small>цена выглядит выгодно</small></div>
+          <div><i data-lucide="badge-dollar-sign"></i><span>Продавать</span><strong id="analytics-liquid">—</strong><small>хорошее окно продажи</small></div>
+          <div><i data-lucide="hourglass"></i><span>Ждать / держать</span><strong id="analytics-matches">—</strong><small>вход пока невыгоден</small></div>
         </section>
         <section class="recommendation-section">
           <header><div><span class="eyebrow">Решение</span><h3>Рекомендации</h3></div><small id="recommendation-context">На основе цены, тренда, ликвидности и движения предложения</small></header>
           <div id="recommendation-list" class="recommendation-list"><div class="recommendation-empty">Рекомендации появятся после расчёта аналитики</div></div>
         </section>
+        </div>
+        <div id="advisor-metrics-panel" class="advisor-panel hidden">
         <section class="analytics-toolbar">
           <label><span>Регион</span><select id="analytics-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
           <label><span>Сигнал</span><select id="analytics-signal"><option value="all">Все</option><option value="strong">Сильные</option><option value="interesting">Интересные</option><option value="risk">С риском</option></select></label>
           <label><span>Сортировка</span><select id="analytics-sort"><option value="score">Индекс возможности</option><option value="discount">Скидка</option><option value="liquidity">Ликвидность</option><option value="trend">Рост цены</option></select></label>
         </section>
         <section id="analytics-list" class="analytics-list"><div class="analytics-empty"><i data-lucide="sparkles"></i><strong>Рассчитайте рыночные сигналы</strong><span>Нужны активные правила и доступ к API</span></div></section>
+        </div>
       </div>
 
       <div id="scanner-view" class="workspace-view hidden">
-        <section class="scanner-head">
-          <div><span class="eyebrow">Поиск сделок</span><h2>Сканер возможностей</h2><small id="scanner-updated">Ранжирует предметы из активных правил</small></div>
-          <button id="scanner-load" class="primary"><i data-lucide="refresh-cw"></i> Сканировать</button>
+        <section class="analytics-head">
+          <div><span class="eyebrow">Рыночный советник</span><h2>Исполнимые сделки</h2><small id="scanner-updated">Текущая покупка, ожидаемый выход и риск</small></div>
+          <button id="scanner-load" class="primary"><i data-lucide="refresh-cw"></i> Обновить советник</button>
         </section>
+        <nav class="advisor-tabs" aria-label="Разделы рыночного советника"><button data-advisor="decisions"><i data-lucide="sparkles"></i> Что делать</button><button class="active" data-advisor="deals"><i data-lucide="circle-dollar-sign"></i> Сделки</button><button data-advisor="metrics"><i data-lucide="bar-chart-3"></i> Метрики</button></nav>
         <section class="scanner-toolbar">
           <label><span>Регион</span><select id="scanner-region"><option value="all">Все</option><option>RU</option><option>EU</option><option>NA</option><option>SEA</option><option>NEA</option></select></label>
-          <label><span>Горизонт продажи</span><select id="scanner-horizon"><option value="1">1 день</option><option value="3" selected>3 дня</option><option value="7">7 дней</option><option value="14">14 дней</option></select></label>
-          <label title="Комиссия и другие расходы при перепродаже"><span>Расходы</span><div class="scanner-number"><input id="scanner-fee" type="number" min="0" max="50" step="0.5" value="5" /><b>%</b></div></label>
-          <label title="Скрыть сделки с меньшей ожидаемой чистой доходностью"><span>Доходность от</span><div class="scanner-number"><input id="scanner-min-roi" type="number" min="-100" max="500" step="1" value="5" /><b>%</b></div></label>
+          <label><span>Горизонт продажи ${helpTip("Срок, за который Сканер оценивает вероятность реализации по историческому обороту. Он не меняет историю цен.")}</span><select id="scanner-horizon"><option value="1">1 день</option><option value="3" selected>3 дня</option><option value="7">7 дней</option><option value="14">14 дней</option></select></label>
+          <label><span>Расходы ${helpTip("Комиссия аукциона и другие потери при продаже. Вычитаются из ожидаемой цены выхода до расчёта прибыли.")}</span><div class="scanner-number"><input id="scanner-fee" type="number" min="0" max="50" step="0.5" value="5" /><b>%</b></div></label>
+          <label><span>Доходность от ${helpTip("Скрывает сценарии с меньшей ожидаемой чистой доходностью. Фильтр не превращает прогноз в гарантированный результат.")}</span><div class="scanner-number"><input id="scanner-min-roi" type="number" min="-100" max="500" step="1" value="5" /><b>%</b></div></label>
           <label class="scanner-search"><span>Поиск</span><div><i data-lucide="search"></i><input id="scanner-search" placeholder="Название или Item ID" /></div></label>
         </section>
         <section class="scanner-stats">
-          <div><span>Лучший индекс</span><strong id="scanner-best">—</strong><small id="scanner-best-name">нет расчёта</small></div>
-          <div><span>Подходит</span><strong id="scanner-count">—</strong><small>после фильтров</small></div>
+          <div><span>Лучшая сделка</span><strong id="scanner-best">—</strong><small id="scanner-best-name">нет расчёта</small></div>
+          <div><span>После фильтров</span><strong id="scanner-count">—</strong><small>исполняемых сценариев</small></div>
           <div><span>Средняя доходность</span><strong id="scanner-average-roi">—</strong><small>после расходов</small></div>
-          <div><span>Высокая уверенность</span><strong id="scanner-confident">—</strong><small>достаточно наблюдений</small></div>
+          <div><span>Надёжных данных</span><strong id="scanner-confident">—</strong><small>для оценки сделки</small></div>
         </section>
         <section class="scanner-explainer">
-          <i data-lucide="shield-check"></i><span><strong>Индекс 0–100</strong> учитывает чистую доходность, скорость реализации, устойчивость цены и качество данных. Это оценка рынка, а не гарантия продажи.</span>
+          <i data-lucide="shield-check"></i><span><strong>Сделки отвечают на узкий вопрос:</strong> можно ли купить лучший активный лот сейчас и перепродать его по подтверждённой истории после расходов. Индекс 0–100 сравнивает доходность, срок реализации, риск цены и качество данных; это не гарантия продажи.</span>
         </section>
-        <section id="scanner-list" class="scanner-list"><div class="scanner-empty"><i data-lucide="circle-dollar-sign"></i><strong>Запустите сканирование</strong><span>Нужны активные правила и история продаж</span></div></section>
+        <section id="scanner-list" class="scanner-list"><div class="scanner-empty"><i data-lucide="circle-dollar-sign"></i><strong>Обновите рыночный советник</strong><span>Здесь появятся только сделки, которые можно проверить по текущим лотам</span></div></section>
       </div>
 
       <div id="movement-view" class="workspace-view hidden">
@@ -348,14 +439,15 @@ app.innerHTML = `
             ${artifactQualities.map((quality) => `<label class="quality-chip ${quality.value}"><input type="checkbox" value="${quality.value}" /><span>${quality.label}</span></label>`).join("")}
           </div>
           <div class="movement-upgrade-filter"><span>Заточка</span><label>от <input id="movement-min-upgrade" type="number" min="0" max="15" placeholder="+0" /></label><b>—</b><label>до <input id="movement-max-upgrade" type="number" min="0" max="15" placeholder="+15" /></label></div>
-          <button id="movement-reset-variant" class="icon-button" title="Сбросить редкость и заточку"><i data-lucide="x"></i></button>
+          <div class="movement-amount-filter"><span>Размер лота</span><select id="movement-amount-preset"><option value="all">Все</option><option value="1">1</option><option value="2-4">2–4</option><option value="5-9">5–9</option><option value="10-19">10–19</option><option value="20-49">20–49</option><option value="50+">50+</option><option value="custom">Свой</option></select><input id="movement-min-amount" type="number" min="1" placeholder="от" /><b>—</b><input id="movement-max-amount" type="number" min="1" placeholder="до" /></div>
+          <button id="movement-reset-variant" class="icon-button" title="Сбросить вариант и размер лота"><i data-lucide="x"></i></button>
         </section>
         <section class="movement-stats">
           <div><span>Рынков</span><strong id="movement-markets">—</strong></div>
-          <div><span>Активное предложение</span><strong id="movement-supply">—</strong></div>
-          <div><span>Появилось</span><strong id="movement-appeared">—</strong></div>
-          <div><span>Исчезло</span><strong id="movement-disappeared">—</strong></div>
-          <div><span>Покрытие</span><strong id="movement-coverage">—</strong></div>
+          <div><span>Активное предложение ${helpTip(helpText.supply)}</span><strong id="movement-supply">—</strong></div>
+          <div><span>Появилось ${helpTip("Количество уникальных лотов, впервые замеченных за выбранный период.")}</span><strong id="movement-appeared">—</strong></div>
+          <div><span>Исчезло ${helpTip(helpText.missing)}</span><strong id="movement-disappeared">—</strong></div>
+          <div><span>Полнота обходов ${helpTip(helpText.coverage)}</span><strong id="movement-coverage">—</strong></div>
         </section>
         <section class="movement-layout">
           <div id="movement-list" class="movement-list"><div class="movement-empty">Сначала запустите мониторинг</div></div>
@@ -392,8 +484,16 @@ app.innerHTML = `
       <div><span>Вложение</span><strong id="scenario-investment">—</strong></div><div><span>Выручка</span><strong id="scenario-revenue">—</strong></div><div><span>Чистая прибыль</span><strong id="scenario-profit">—</strong></div><div><span>Доходность</span><strong id="scenario-roi">—</strong></div>
     </section>
     <section class="scenario-summary"><i data-lucide="circle-dollar-sign"></i><div><strong id="scenario-verdict">Введите цены</strong><span id="scenario-break-even">Здесь появится точка безубыточности</span></div></section>
+    <section id="stack-strategy-section" class="stack-strategy-section"><header><div><span class="eyebrow">Премия за пачку</span><h3>Собрать дешевле — продать крупнее</h3></div><button id="stack-strategy-calculate" class="secondary"><i data-lucide="refresh-cw"></i> Рассчитать</button></header><div class="stack-strategy-inputs"><label><span>Покупать лоты до</span><input id="stack-buy-max-amount" type="number" min="1" value="9" /></label><label><span>История пачек от</span><input id="stack-sell-min-amount" type="number" min="1" value="20" /></label><label><span>Собрать единиц</span><input id="stack-target-amount" type="number" min="1" value="20" /></label><label><span>Цена покупки до / шт.</span><div class="money-input"><input id="stack-max-buy-unit" type="number" min="1" placeholder="Без лимита" /><b>₽</b></div></label></div><div id="stack-strategy-result" class="stack-strategy-result"><div class="timing-loading"><span></span>Считаю сборку пачки</div></div></section>
     <section class="timing-section"><header><div><span class="eyebrow">Локальные снимки</span><h3>Когда покупать дешевле</h3></div><small id="timing-sample">Загрузка...</small></header><div id="timing-content" class="timing-content"><div class="timing-loading"><span></span>Анализирую время наблюдений</div></div></section>
   </div></dialog>
+  <dialog id="deep-analysis-dialog" class="deep-analysis-dialog"><div class="dialog-head"><div><span class="eyebrow">Локальная аналитика</span><h2 id="deep-analysis-title">Разбор рынка</h2></div><button class="icon-button" data-close="deep-analysis-dialog"><i data-lucide="x"></i></button></div><div id="deep-analysis-content" class="deep-analysis-content"><div class="timing-loading"><span></span>Считаю структуру рынка</div></div></dialog>
+  <dialog id="ai-analysis-dialog" class="ai-analysis-dialog"><div class="dialog-head"><div><span class="eyebrow">ИИ-провайдер · необязательно</span><h2 id="ai-analysis-title">ИИ-разбор сделки</h2></div><button class="icon-button" data-close="ai-analysis-dialog"><i data-lucide="x"></i></button></div><div class="ai-analysis-content">
+    <section class="ai-provider"><label><span>Адрес</span><input id="ai-endpoint" type="text" value="http://127.0.0.1:11434/api/chat" placeholder="LM Studio: http://server:1234/v1/chat/completions" /></label><label><span>Модель</span><input id="ai-model" type="text" value="gemma3:4b" placeholder="Точный ID из /v1/models" /></label><label><span>API key · не сохраняется</span><input id="ai-api-key" type="password" autocomplete="off" placeholder="Необязательно" /></label><button id="ai-analyze" class="primary"><i data-lucide="sparkles"></i> Анализировать</button></section>
+    <div class="ai-privacy"><i data-lucide="shield-check"></i><span>ИИ отключён по умолчанию и вызывается только этой кнопкой. Удалённый сервер получит компактный набор рыночных показателей, но не ключ STALCRAFT и не полную базу.</span></div>
+    <div id="ai-analysis-content" class="ai-analysis-result"><div class="timing-empty"><i data-lucide="sparkles"></i><strong>Модель дополнит расчёты объяснением</strong><span>Она не заменяет числовую аналитику и не является гарантией сделки.</span></div></div>
+  </div></dialog>
+  <div id="help-popover" class="help-popover" role="tooltip"><strong>Как читать показатель</strong><p></p></div>
   <div id="toast" class="toast"></div>
 `;
 
@@ -404,7 +504,6 @@ const input = (id: string) => $<HTMLInputElement>(`#${id}`);
 const value = (id: string) => input(id).value.trim();
 const numberValue = (id: string): number | undefined => value(id) === "" ? undefined : Number(value(id));
 const money = (amount?: number) => amount == null ? "—" : Math.round(amount).toLocaleString("ru-RU");
-const escapeHtml = (text: string) => text.replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]!);
 
 let catalog: CatalogItem[] = [];
 let selected: CatalogItem | undefined;
@@ -415,7 +514,12 @@ let matches: MatchRecord[] = [];
 let category = "";
 let realm = "global";
 let monitorTimer: number | undefined;
+let rapidMonitorTimer: number | undefined;
 let checking = false;
+let rapidChecking = false;
+let rapidBaselinePending = false;
+let rapidBackoffUntil = 0;
+let rapidNextDue = new Map<string, number>();
 let editingIndex: number | undefined;
 let ruleSummaries: RuleSummary[] = [];
 let nextCheckAt: number | undefined;
@@ -428,14 +532,63 @@ let historyDisplayMode: "chart" | "table" = "chart";
 let historyChart: IChartApi | undefined;
 let historyResizeObserver: ResizeObserver | undefined;
 let analyticsInsights: MarketInsight[] = [];
-let recommendationMovements: MarketMovement[] = [];
 let scannerInsights: MarketInsight[] = [];
-let scannerMovements: MarketMovement[] = [];
+let automaticStackStrategies = new Map<string, StackStrategyAnalysis>();
 let scenarioOpportunity: MarketOpportunity | undefined;
+let aiOpportunity: MarketOpportunity | undefined;
 let movementMarkets: MarketMovement[] = [];
 let selectedMovementKey: string | undefined;
 let movementChart: IChartApi | undefined;
 let movementResizeObserver: ResizeObserver | undefined;
+let pinnedHelp: HTMLElement | undefined;
+
+function showHelp(button: HTMLElement, pin = false) {
+  const popover = $("#help-popover");
+  const message = button.dataset.help;
+  if (!message) return;
+  popover.querySelector("p")!.textContent = message;
+  popover.classList.add("show");
+  if (pin) pinnedHelp = button;
+  const rect = button.getBoundingClientRect();
+  const width = popover.offsetWidth;
+  const height = popover.offsetHeight;
+  const left = Math.max(10, Math.min(window.innerWidth - width - 10, rect.left + rect.width / 2 - width / 2));
+  const below = rect.bottom + 8;
+  const top = below + height <= window.innerHeight - 10 ? below : Math.max(10, rect.top - height - 8);
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+}
+
+function hideHelp(force = false) {
+  if (pinnedHelp && !force) return;
+  pinnedHelp = undefined;
+  $("#help-popover").classList.remove("show");
+}
+
+document.addEventListener("pointerover", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLElement>(".metric-help");
+  if (button && !pinnedHelp) showHelp(button);
+});
+document.addEventListener("pointerout", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLElement>(".metric-help");
+  if (button && !button.contains(event.relatedTarget as Node | null)) hideHelp();
+});
+document.addEventListener("focusin", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLElement>(".metric-help");
+  if (button) showHelp(button);
+});
+document.addEventListener("focusout", (event) => {
+  if ((event.target as HTMLElement).closest(".metric-help")) hideHelp();
+});
+document.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLElement>(".metric-help");
+  if (button) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (pinnedHelp === button) hideHelp(true); else { pinnedHelp = undefined; showHelp(button, true); }
+  } else if (pinnedHelp) hideHelp(true);
+});
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") hideHelp(true); });
 
 function toast(message: string, danger = false) {
   const element = $("#toast");
@@ -529,6 +682,7 @@ function updateCategoryCount() {
   const total = categoryItems().length;
   const selectedCount = categorySelectedIds.size;
   $("#category-item-count").textContent = `${selectedCount.toLocaleString("ru-RU")} выбрано из ${total.toLocaleString("ru-RU")}`;
+  if (document.querySelector("#rapid-monitor")) renderRapidRuleControls();
 }
 
 function renderRuleScope() {
@@ -536,6 +690,19 @@ function renderRuleScope() {
   $("#category-scope").classList.toggle("hidden", ruleScope !== "category");
   $("#rule-scope").querySelectorAll("button").forEach((button) =>
     button.classList.toggle("active", (button as HTMLButtonElement).dataset.value === ruleScope));
+  renderRapidRuleControls();
+}
+
+function renderRapidRuleControls() {
+  const enabled = input("rapid-monitor").checked;
+  const interval = Math.max(3, Math.min(10, Number(input("rapid-interval").value) || 5));
+  const itemCount = ruleScope === "category" ? Math.max(1, categorySelectedIds.size) : 1;
+  $("#rapid-settings").classList.toggle("hidden", !enabled);
+  $("#rapid-warning").classList.toggle("hidden", !enabled);
+  $("#rapid-interval-value").textContent = `${interval} сек`;
+  $("#rapid-budget-title").textContent = `${itemCount} ${itemCount === 1 ? "запрос" : itemCount < 5 ? "запроса" : "запросов"} каждые ${interval} сек`;
+  $("#rapid-budget-note").textContent = `${(itemCount / interval).toFixed(2)} запроса/с · запрашиваются 5 последних лотов каждого предмета`;
+  input("current-percent").disabled = enabled;
 }
 
 function expandedRules(source = rules): Rule[] {
@@ -566,7 +733,13 @@ function currentRule(): Rule {
   const selectedQualities = [...document.querySelectorAll<HTMLInputElement>("#quality-options input:checked")].map((checkbox) => checkbox.value as ArtifactQuality);
   const minUpgrade = numberValue("min-upgrade");
   const maxUpgrade = numberValue("max-upgrade");
+  const minAmount = numberValue("min-amount");
+  const maxAmount = numberValue("max-amount");
+  const rapidMonitor = input("rapid-monitor").checked;
+  const rapidIntervalSeconds = Math.max(3, Math.min(10, Math.round(numberValue("rapid-interval") ?? 5)));
   if (minUpgrade != null && maxUpgrade != null && minUpgrade > maxUpgrade) throw new Error("Минимальная заточка не может быть больше максимальной");
+  if (minAmount != null && maxAmount != null && minAmount > maxAmount) throw new Error("Минимальное количество не может быть больше максимального");
+  if (rapidMonitor && ruleScope === "category" && items.length > 15) throw new Error("Для оперативного мониторинга выберите не более 15 предметов");
   return {
     name: value("rule-name") || (ruleScope === "category" ? `Лучшее в ${categoryName}` : selected?.nameRu) || itemId,
     itemId,
@@ -575,11 +748,13 @@ function currentRule(): Rule {
     category: ruleScope === "category" ? categoryName : undefined,
     itemIds: ruleScope === "category" ? items.map((item) => item.id) : undefined,
     topN: ruleScope === "category" ? Number($<HTMLSelectElement>("#category-top").value) : undefined,
-    maxBuyout: numberValue("max-buyout"), maxUnitBuyout: numberValue("max-unit"), minAmount: numberValue("min-amount"),
+    maxBuyout: numberValue("max-buyout"), maxUnitBuyout: numberValue("max-unit"), minAmount, maxAmount,
     artifactQualities: selectedQualities, minUpgrade, maxUpgrade,
     maxHistoryMedianRatio: numberValue("history-percent") == null ? undefined : numberValue("history-percent")! / 100,
-    maxCurrentMinRatio: numberValue("current-percent") == null ? undefined : numberValue("current-percent")! / 100,
-    historyLimit: 100, limit: 50, sort: "time_created", order: "desc", additional: true,
+    maxCurrentMinRatio: rapidMonitor || numberValue("current-percent") == null ? undefined : numberValue("current-percent")! / 100,
+    historyLimit: 100, limit: 50, sort: "time_created", order: "desc",
+    additional: selectedQualities.length > 0 || minUpgrade != null || maxUpgrade != null,
+    rapidMonitor, rapidIntervalSeconds, rapidLimit: 5,
   };
 }
 
@@ -593,10 +768,11 @@ function describeRange(label: string, min?: number, max?: number, prefix = "") {
 function describeRule(rule: Rule) {
   const qualities = rule.artifactQualities?.map((value) => artifactQualities.find((quality) => quality.value === value)?.label).filter(Boolean);
   return [
+    rule.rapidMonitor ? `оперативно · ${rule.rapidIntervalSeconds || 5} сек` : "",
     rule.scope === "category" ? `${rule.itemIds?.length || 0} предметов · топ ${rule.topN || 1}` : "",
     rule.maxBuyout != null ? `лот ≤ ${money(rule.maxBuyout)}` : "",
     rule.maxUnitBuyout != null ? `шт. ≤ ${money(rule.maxUnitBuyout)}` : "",
-    rule.minAmount != null ? `кол-во ≥ ${rule.minAmount}` : "",
+    describeRange("кол-во", rule.minAmount, rule.maxAmount),
     qualities?.length ? `редкость: ${qualities.join(", ")}` : "",
     describeRange("заточка", rule.minUpgrade, rule.maxUpgrade, "+"),
     rule.maxHistoryMedianRatio != null ? `≤ ${rule.maxHistoryMedianRatio * 100}% медианы` : "",
@@ -609,6 +785,7 @@ function ruleTargetLabel(rule: Rule) {
 }
 
 type WorkspaceView = "overview" | "config" | "history" | "analytics" | "scanner" | "movement";
+type AdvisorSection = "decisions" | "deals" | "metrics";
 
 function switchView(view: WorkspaceView) {
   $("#overview-view").classList.toggle("hidden", view !== "overview");
@@ -617,9 +794,22 @@ function switchView(view: WorkspaceView) {
   $("#analytics-view").classList.toggle("hidden", view !== "analytics");
   $("#scanner-view").classList.toggle("hidden", view !== "scanner");
   $("#movement-view").classList.toggle("hidden", view !== "movement");
+  const navigationView = view === "scanner" ? "analytics" : view;
   document.querySelectorAll<HTMLButtonElement>(".workspace-tabs button").forEach((button) =>
-    button.classList.toggle("active", button.dataset.view === view));
+    button.classList.toggle("active", button.dataset.view === navigationView));
   $(".workspace").scrollTop = 0;
+}
+
+function switchAdvisorSection(section: AdvisorSection) {
+  if (section === "deals") {
+    switchView("scanner");
+  } else {
+    switchView("analytics");
+    $("#advisor-decisions-panel").classList.toggle("hidden", section !== "decisions");
+    $("#advisor-metrics-panel").classList.toggle("hidden", section !== "metrics");
+  }
+  document.querySelectorAll<HTMLButtonElement>(".advisor-tabs button").forEach((button) =>
+    button.classList.toggle("active", button.dataset.advisor === section));
 }
 
 function summaryFor(rule: Rule) {
@@ -664,7 +854,7 @@ function renderOverview() {
     if (!summary) return `<article class="market-rule pending" data-market-rule="${index}">
       <div class="market-rule-main"><span class="rule-region">${escapeHtml(rule.region)}</span><div><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(describeRule(rule))}</small></div></div>
       <div class="market-pending"><span></span>Ожидает проверки</div>
-      <button class="icon-button small market-edit" title="Изменить правило"><i data-lucide="pencil"></i></button>
+      <div class="market-rule-actions"><button class="icon-button small market-edit" title="Изменить правило"><i data-lucide="pencil"></i></button></div>
     </article>`;
     const position = marketPosition(rule, summary);
     const stateClass = summary.matchingLots > 0 ? "success" : summary.totalLots ? "quiet" : "empty";
@@ -674,7 +864,7 @@ function renderOverview() {
     return `<article class="market-rule ${stateClass}" data-market-rule="${index}">
       <div class="market-rule-main"><span class="rule-region">${escapeHtml(rule.region)}</span><div><strong>${escapeHtml(rule.name)}</strong><small>${escapeHtml(ruleTargetLabel(rule))} · ${escapeHtml(describeRule(rule))}</small></div></div>
       <div class="market-state ${stateClass}"><span></span>${stateText}</div>
-      <button class="icon-button small market-edit" title="Изменить правило"><i data-lucide="pencil"></i></button>
+      <div class="market-rule-actions"><button class="secondary small market-lots" title="Показать активные лоты"><i data-lucide="table-2"></i> Лоты</button><button class="icon-button small market-edit" title="Изменить правило"><i data-lucide="pencil"></i></button></div>
       <div class="market-metrics">
         <div><span>Минимум рынка</span><strong>${money(market)} ₽</strong></div>
         <div><span>Ваш лимит</span><strong>${money(limit)} ₽</strong></div>
@@ -682,9 +872,48 @@ function renderOverview() {
         <div><span>Сравнимых</span><strong>${summary.comparableLots}</strong></div>
       </div>
       <div class="price-position"><div><span>${position.favorable ? "В пределах правила" : "Пока вне правила"}</span><b>${position.text}</b></div><div class="price-track"><span class="${position.favorable ? "favorable" : ""}" style="width:${position.percent}%"></span></div></div>
+      <div class="market-active-lots hidden"></div>
     </article>`;
   }).join("") || `<div class="overview-empty"><i data-lucide="sliders-horizontal"></i><strong>Добавьте первое правило</strong><button class="secondary" data-open-config>Настроить фильтры</button></div>`;
   createIcons({ icons: appIcons });
+}
+
+function activeLotTime(value?: string) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+async function toggleActiveLots(card: HTMLElement, ruleIndex: number) {
+  const panel = card.querySelector<HTMLElement>(".market-active-lots");
+  const button = card.querySelector<HTMLButtonElement>(".market-lots");
+  if (!panel || !button) return;
+  if (panel.dataset.loaded === "true") {
+    panel.classList.toggle("hidden");
+    button.classList.toggle("active", !panel.classList.contains("hidden"));
+    return;
+  }
+  panel.classList.remove("hidden");
+  button.classList.add("active", "busy");
+  panel.innerHTML = `<div class="active-lots-loading"><span></span>Читаю последний снимок рынка</div>`;
+  try {
+    const response = await invoke<ActiveLotsResponse>("active_lots_for_rules", {
+      rules: expandedRules([rules[ruleIndex]]), limit: 100,
+    });
+    const snapshotState = response.markets === response.completeMarkets ? "полный обход" : `${response.completeMarkets} из ${response.markets} полных обходов`;
+    const rows = response.lots.map((lot) => {
+      const item = catalog.find((candidate) => candidate.id === lot.itemId);
+      const variant = [lot.quality, lot.upgrade == null ? "" : `+${lot.upgrade}`].filter(Boolean).join(" · ") || "—";
+      return `<tr class="${lot.matchesRule ? "matches" : ""}"><td><strong>${escapeHtml(item?.nameRu || item?.nameEn || lot.itemId)}</strong><small>${escapeHtml(lot.itemId)}</small></td><td>${escapeHtml(variant)}</td><td>${lot.amount.toLocaleString("ru-RU")}</td><td><strong>${money(lot.unitPrice)} ₽</strong></td><td>${money(lot.buyout)} ₽</td><td>${money(lot.currentPrice)} ₽</td><td>${escapeHtml(activeLotTime(lot.endTime))}</td><td><span class="active-lot-state ${lot.matchesRule ? "match" : "outside"}">${lot.matchesRule ? "Подходит" : "Вне правила"}</span></td></tr>`;
+    }).join("");
+    panel.innerHTML = `<div class="active-lots-head"><div><strong>Активные лоты</strong><span>${response.total.toLocaleString("ru-RU")} сравнимых · показано ${response.returned.toLocaleString("ru-RU")} самых дешёвых</span></div><small>${response.collectedAt ? activeLotTime(response.collectedAt) : "нет снимка"} · ${escapeHtml(snapshotState)}</small></div><div class="active-lots-table"><table><thead><tr><th>Предмет</th><th>Вариант</th><th>Шт.</th><th>За штуку</th><th>Выкуп</th><th>Ставка</th><th>Окончание</th><th>Правило</th></tr></thead><tbody>${rows || `<tr><td colspan="8" class="table-empty">В последнем снимке нет сравнимых активных лотов</td></tr>`}</tbody></table></div>`;
+    panel.dataset.loaded = "true";
+  } catch (error) {
+    panel.innerHTML = `<div class="active-lots-error"><i data-lucide="triangle-alert"></i><span>${escapeHtml(String(error))}</span></div>`;
+    createIcons({ icons: appIcons });
+  } finally {
+    button.classList.remove("busy");
+  }
 }
 
 function itemIsArtifact(item?: CatalogItem) {
@@ -796,7 +1025,7 @@ function renderSalesHistory() {
   $("#history-table-body").innerHTML = [...entries].sort((a, b) => Date.parse(b.time) - Date.parse(a.time)).map((entry) => `<tr>
     <td>${escapeHtml(new Date(entry.time).toLocaleString("ru-RU"))}</td>
     ${artifact ? `<td><span class="table-quality quality-${entry.qualityCode ?? "none"}">${escapeHtml(entry.quality || "—")}</span></td><td>${entry.upgrade == null ? "—" : `+${entry.upgrade}`}</td>` : ""}
-    <td><span class="history-source-badge ${entry.source === "schistory" ? "external" : "official"}">${entry.source === "schistory" ? "SCHistory" : "API"}</span></td><td>${entry.amount.toLocaleString("ru-RU")}</td><td>${money(entry.price)} ₽</td><td>${money(entry.unitPrice)} ₽</td>
+    <td><span class="history-source-badge ${entry.source === "schistory" ? "external" : "official"}">${entry.source === "schistory" ? "SCHistory API" : "STALZONE API"}</span></td><td>${entry.amount.toLocaleString("ru-RU")}</td><td>${money(entry.price)} ₽</td><td>${money(entry.unitPrice)} ₽</td>
   </tr>`).join("") || `<tr><td colspan="7" class="table-empty">Нет продаж по выбранным фильтрам</td></tr>`;
   renderHistoryChart(entries);
 }
@@ -916,29 +1145,34 @@ function roundRecommendationPrice(price: number) {
 }
 
 function recommendationFor(insight: MarketInsight): MarketRecommendation {
-  const movement = recommendationMovements.find((item) => item.itemId === insight.itemId && item.region === insight.region);
   const discount = insight.discountPercent ?? 0;
   const trend = insight.trendPercent ?? 0;
   const volatility = insight.volatilityPercent ?? 0;
-  const supplyChange = movement?.supplyChangePercent;
-  const priceMovement = movement?.priceChangePercent;
+  const supplyChange = insight.movementSupplyChangePercent;
+  const priceMovement = insight.movementPriceChangePercent;
   const oversupply = supplyChange != null && supplyChange >= 15 && (priceMovement ?? 0) <= 0;
   const weakData = insight.salesSample < 30;
   const highRisk = weakData || volatility >= 40 || (insight.liquidity === "Низкая" && insight.risks.length > 0);
+  const stack = automaticStackStrategies.get(insightKey(insight));
+  const stackFee = Math.max(0, Math.min(50, numberValue("scanner-fee") ?? 5)) / 100;
+  const stackRoi = stack?.complete && stack.averageBuyUnit != null && stack.expectedSellUnit != null
+    ? (stack.expectedSellUnit * (1 - stackFee) - stack.averageBuyUnit) / stack.averageBuyUnit * 100 : undefined;
+  const stackOpportunity = stackRoi != null && stackRoi >= 5 && (stack?.bulkSalesSample ?? 0) >= 5;
   let action: RecommendationAction;
-  if (highRisk && discount < 20) action = "risk";
+  if (stackOpportunity) action = "buy";
+  else if (highRisk && discount < 20) action = "risk";
   else if (discount >= 12 && insight.opportunityScore >= 60 && insight.liquidity !== "Низкая" && !oversupply && trend >= -5) action = "buy";
   else if (discount <= -8 && insight.liquidity !== "Низкая") action = "sell";
   else if (oversupply || (discount < 8 && trend <= 0)) action = "wait";
   else if (trend >= 5 && !oversupply) action = "hold";
   else action = "wait";
 
-  const labels: Record<RecommendationAction, [string, string]> = {
-    buy: ["Купить сейчас", "Цена заметно ниже справедливой, а рынок способен поглотить предложение."],
-    sell: ["Продать сейчас", "Текущая рыночная цена выше исторического ориентира."],
-    wait: ["Ждать просадки", "Запас выгоды недостаточен для уверенного входа."],
-    hold: ["Держать", "Цена сохраняет положительный импульс без явного давления предложения."],
-    risk: ["Рискованно", "Данных или ликвидности недостаточно для надёжного решения."],
+  const labels: Record<RecommendationAction, [string, string, string, string]> = {
+    buy: ["Покупка выглядит выгодно", stackOpportunity ? `Можно собрать пачку ${stack!.targetAmount} шт. из дешёвых малых лотов и продать по истории крупных пачек.` : "Цена заметно ниже рыночного ориентира, а ликвидность поддерживает вход.", stackOpportunity ? `Собрать пачку из ${stack!.purchaseLots} лотов` : "Рассмотреть покупку", "Держать: рынок поддерживает цену"],
+    sell: ["Хорошее окно для продажи", "Текущее предложение дороже подтверждённых продаж сопоставимого варианта.", "Не покупать по текущей цене", "Рассмотреть продажу"],
+    wait: ["Лучше подождать", "Запас выгоды пока недостаточен для уверенного входа.", "Ждать более низкую цену", oversupply ? "Продать раньше роста конкуренции" : "Не спешить с продажей"],
+    hold: ["Рынок поддерживает удержание", "Цена растёт, а заметного давления предложения пока нет.", "Не догонять рост цены", "Держать и следить за предложением"],
+    risk: ["Надёжного сигнала пока нет", "Данных или ликвидности недостаточно для уверенного решения.", "Пропустить до новых данных", "Решать только с запасом по цене"],
   };
   const reasons = [
     insight.currentMinUnit != null && (insight.fairValueUnit ?? insight.medianUnit) != null
@@ -946,48 +1180,64 @@ function recommendationFor(insight: MarketInsight): MarketRecommendation {
       : "Недостаточно данных для сравнения с медианой.",
     `Тренд ${signedPercent(insight.trendPercent)}, ликвидность ${insight.liquidity.toLocaleLowerCase("ru")}, разброс ${signedPercent(insight.volatilityPercent)}.`,
   ];
-  if (supplyChange != null) reasons.push(`Предложение за 24 часа ${signedPercent(supplyChange)}, медианная цена ${signedPercent(priceMovement)}; официальных продаж ${movement?.officialSales ?? 0}.`);
+  if (stackOpportunity) reasons.unshift(`Средняя закупка ${money(stack!.averageBuyUnit)} ₽/шт., ожидаемая продажа пачкой ${money(stack!.expectedSellUnit)} ₽/шт., доходность после расходов ${signedPercent(stackRoi)}.`);
+  if (supplyChange != null) reasons.push(`Сопоставимое предложение за 24 часа ${signedPercent(supplyChange)}, медиана предложений ${signedPercent(priceMovement)}.`);
   if (insight.risks.length) reasons.push(`Риски: ${insight.risks.join(", ").toLocaleLowerCase("ru")}.`);
-  const fair = insight.fairValueUnit ?? insight.medianUnit;
-  const targetLow = fair == null ? undefined : roundRecommendationPrice(Math.max(fair * .75, Math.min(insight.p25Unit ?? fair * .85, fair * .85)));
-  const targetHigh = fair == null ? undefined : roundRecommendationPrice(fair * .9);
-  const confidence = insight.salesSample >= 100 && (movement?.collections ?? 0) >= 5 && volatility < 30
-    ? "Высокая" : insight.salesSample >= 30 && volatility < 45 ? "Средняя" : "Низкая";
-  return { insight, action, title: labels[action][0], summary: labels[action][1], reasons, targetLow, targetHigh, confidence };
+  const fair = stackOpportunity ? stack!.expectedSellUnit : insight.fairValueUnit ?? insight.medianUnit;
+  const stackBuyLimit = stackOpportunity && fair != null ? fair * (1 - stackFee) / 1.05 : undefined;
+  const targetLow = stackBuyLimit != null ? roundRecommendationPrice(stackBuyLimit * .95)
+    : fair == null ? undefined : roundRecommendationPrice(Math.max(fair * .75, Math.min(insight.p25Unit ?? fair * .85, fair * .85)));
+  const targetHigh = stackBuyLimit != null ? roundRecommendationPrice(stackBuyLimit)
+    : fair == null ? undefined : roundRecommendationPrice(fair * .9);
+  const decisionSample = stackOpportunity ? stack!.bulkSalesSample : insight.salesSample;
+  const dataQuality = decisionSample >= 100 && insight.movementCollections >= 5 && insight.movementCoveragePercent >= 80 && volatility < 30
+    ? "Высокое" : decisionSample >= 30 && volatility < 45 ? "Среднее" : "Низкое";
+  const decisionStrength = Math.abs(stackRoi ?? discount) + Math.min(20, Math.abs(trend))
+    + Math.min(20, decisionSample / 10) + (dataQuality === "Высокое" ? 12 : dataQuality === "Среднее" ? 6 : 0);
+  return {
+    insight, action, title: labels[action][0], summary: labels[action][1], reasons,
+    buyerAction: labels[action][2], ownerAction: labels[action][3], decisionStrength,
+    currentBuyUnit: stackOpportunity ? stack!.averageBuyUnit : insight.currentMinUnit,
+    marketReferenceUnit: fair, contextLabel: stackOpportunity ? `сборка ${stack!.targetAmount} шт. → продажа ${stack!.sellMinAmount}+` : insight.comparisonAmountLabel,
+    decisionRoi: stackOpportunity ? stackRoi : undefined, dataSample: decisionSample,
+    targetLow, targetHigh, dataQuality,
+  };
 }
 
 function renderRecommendations(region: string) {
-  const actionMeta: Record<RecommendationAction, { icon: string; priority: number }> = {
-    buy: { icon: "shopping-cart", priority: 5 }, sell: { icon: "badge-dollar-sign", priority: 4 },
-    wait: { icon: "hourglass", priority: 3 }, hold: { icon: "hand", priority: 2 }, risk: { icon: "triangle-alert", priority: 1 },
+  const actionMeta: Record<RecommendationAction, { icon: string }> = {
+    buy: { icon: "shopping-cart" }, sell: { icon: "badge-dollar-sign" },
+    wait: { icon: "hourglass" }, hold: { icon: "hand" }, risk: { icon: "triangle-alert" },
   };
   const recommendations = analyticsInsights.filter((item) => region === "all" || item.region === region)
     .map(recommendationFor)
-    .sort((a, b) => actionMeta[b.action].priority - actionMeta[a.action].priority || b.insight.opportunityScore - a.insight.opportunityScore)
+    .sort((a, b) => b.decisionStrength - a.decisionStrength)
     .slice(0, 8);
-  $("#recommendation-context").textContent = recommendationMovements.length
-    ? "Цена, история продаж и движение предложения за 24 часа"
-    : "Цена, история продаж, тренд и ликвидность";
+  $("#recommendation-context").textContent = "Сравниваются обычная перепродажа и сборка крупных пачек, если предмет складывается";
   $("#recommendation-list").innerHTML = recommendations.map((item) => {
     const target = item.targetLow != null && item.targetHigh != null ? `${money(item.targetLow)}–${money(item.targetHigh)} ₽/шт.` : "Недостаточно данных";
+    const canCreateRule = (item.action === "buy" || item.action === "wait" || item.action === "risk") && item.targetHigh != null;
+    const ruleButton = canCreateRule
+      ? `<button class="secondary recommendation-rule"><i data-lucide="bell-plus"></i> Следить ≤ ${money(item.targetHigh)} ₽</button>` : "";
     return `<article class="recommendation-card ${item.action}" data-recommendation-id="${escapeHtml(item.insight.itemId)}" data-recommendation-region="${escapeHtml(item.insight.region)}" data-target-high="${item.targetHigh ?? ""}">
-      <div class="recommendation-heading"><span class="recommendation-icon"><i data-lucide="${actionMeta[item.action].icon}"></i></span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)}</small></div><span class="recommendation-action">${escapeHtml(item.title)}</span></div>
+      <div class="recommendation-heading"><span class="recommendation-icon"><i data-lucide="${actionMeta[item.action].icon}"></i></span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.contextLabel)} · ${escapeHtml(item.insight.itemId)}</small></div><span class="recommendation-action">${escapeHtml(item.title)}</span></div>
       <p>${escapeHtml(item.summary)}</p>
-      <div class="recommendation-reasons">${item.reasons.slice(0, 3).map((reason) => `<span>${escapeHtml(reason)}</span>`).join("")}</div>
-      <footer><div><span>Цена для правила</span><strong>${target}</strong><small>Уверенность: ${item.confidence.toLocaleLowerCase("ru")}</small></div><button class="secondary recommendation-rule"><i data-lucide="plus"></i> Создать правило</button></footer>
+      <div class="recommendation-market"><div><span>${item.contextLabel.startsWith("сборка") ? "Средняя закупка" : "Сейчас / шт."}</span><strong>${money(item.currentBuyUnit)} ₽</strong></div><div><span>${item.contextLabel.startsWith("сборка") ? "Ожидаемая продажа" : "Рыночный ориентир"}</span><strong>${money(item.marketReferenceUnit)} ₽</strong></div><div><span>${item.contextLabel.startsWith("сборка") ? "ROI после расходов" : "Отклонение"}</span><strong class="${(item.decisionRoi ?? item.insight.discountPercent ?? 0) >= 0 ? "positive" : "negative"}">${item.contextLabel.startsWith("сборка") ? signedPercent(item.decisionRoi) : signedPercent(item.insight.discountPercent)}</strong></div><div><span>Зона покупки</span><strong>${target}</strong></div></div>
+      <div class="recommendation-paths"><div><span>Если хотите купить</span><strong>${escapeHtml(item.buyerAction)}</strong></div><div><span>Если предмет уже у вас</span><strong>${escapeHtml(item.ownerAction)}</strong></div></div>
+      <details class="recommendation-details"><summary>Почему такой вывод</summary><div class="recommendation-reasons">${item.reasons.slice(0, 4).map((reason) => `<span>${escapeHtml(reason)}</span>`).join("")}</div></details>
+      <footer><div><span>Качество данных</span><strong>${item.dataQuality}</strong><small>${item.dataSample.toLocaleString("ru-RU")} продаж · ${item.insight.movementCollections} снимков · полнота ${item.insight.movementCoveragePercent.toFixed(0)}%</small></div><div class="recommendation-buttons"><button class="secondary recommendation-metrics"><i data-lucide="bar-chart-3"></i> Метрики</button>${ruleButton}</div></footer>
     </article>`;
   }).join("") || `<div class="recommendation-empty">Нет рекомендаций по выбранному региону</div>`;
   createIcons({ icons: appIcons });
 }
 
 function renderAnalytics() {
-  const discounts = analyticsInsights.map((item) => item.discountPercent).filter((value): value is number => value != null);
-  const best = analyticsInsights[0];
-  $("#analytics-best").textContent = best ? `${best.opportunityScore}/100` : "—";
-  $("#analytics-best-name").textContent = best?.name || "нет расчёта";
-  $("#analytics-discount").textContent = discounts.length ? signedPercent(discounts.reduce((sum, value) => sum + value, 0) / discounts.length) : "—";
-  $("#analytics-liquid").textContent = analyticsInsights.length ? String(analyticsInsights.filter((item) => item.liquidity === "Высокая").length) : "—";
-  $("#analytics-matches").textContent = analyticsInsights.length ? String(analyticsInsights.reduce((sum, item) => sum + item.matchingLots, 0)) : "—";
+  const decisions = analyticsInsights.map(recommendationFor);
+  $("#analytics-best").textContent = analyticsInsights.length ? String(analyticsInsights.length) : "—";
+  $("#analytics-best-name").textContent = analyticsInsights.length === 1 ? analyticsInsights[0].name : "вариантов рынка";
+  $("#analytics-discount").textContent = analyticsInsights.length ? String(decisions.filter((item) => item.action === "buy").length) : "—";
+  $("#analytics-liquid").textContent = analyticsInsights.length ? String(decisions.filter((item) => item.action === "sell").length) : "—";
+  $("#analytics-matches").textContent = analyticsInsights.length ? String(decisions.filter((item) => item.action === "wait" || item.action === "hold").length) : "—";
 
   const region = $<HTMLSelectElement>("#analytics-region").value;
   renderRecommendations(region);
@@ -1012,13 +1262,13 @@ function renderAnalytics() {
     const discountClass = (item.discountPercent ?? 0) > 0 ? "positive" : "negative";
     const trendClass = (item.trendPercent ?? 0) > 0 ? "positive" : (item.trendPercent ?? 0) < 0 ? "negative" : "";
     return `<article class="insight-card ${scoreClass}" data-insight-id="${escapeHtml(item.itemId)}" data-insight-region="${escapeHtml(item.region)}">
-      <div class="insight-heading"><span class="rule-region">${escapeHtml(item.region)}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.itemId)} · ${item.salesSample} продаж в расчёте</small></div></div>
-      <div class="score-box ${scoreClass}"><strong>${item.opportunityScore}</strong><span>${escapeHtml(item.verdict)}</span></div>
+      <div class="insight-heading"><span class="rule-region">${escapeHtml(item.region)}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.itemId)} · пачки ${escapeHtml(item.comparisonAmountLabel)} · ${item.salesSample} продаж</small></div></div>
+      <div class="score-box ${scoreClass}"><strong>${item.opportunityScore}</strong><span>${escapeHtml(item.verdict)} ${helpTip(helpText.opportunityScore)}</span></div>
       <div class="insight-actions"><button class="icon-button small insight-history" title="Открыть историю продаж"><i data-lucide="history"></i></button><button class="icon-button small insight-edit" title="Изменить правило"><i data-lucide="pencil"></i></button></div>
-      <div class="insight-signal"><div><span>Текущий минимум</span><strong>${money(item.currentMinUnit)} ₽/шт.</strong></div><div><span>Адаптивная цена</span><strong>${money(item.fairValueUnit ?? item.medianUnit)} ₽/шт.</strong></div><div><span>Отклонение</span><strong class="${discountClass}">${signedPercent(item.discountPercent)}</strong></div></div>
+      <div class="insight-signal"><div><span>Текущий минимум ${helpTip(helpText.askMinimum)}</span><strong>${money(item.currentMinUnit)} ₽/шт.</strong></div><div><span>Адаптивная цена ${helpTip(helpText.adaptivePrice)}</span><strong>${money(item.fairValueUnit ?? item.medianUnit)} ₽/шт.</strong></div><div><span>Отклонение ${helpTip(helpText.deviation)}</span><strong class="${discountClass}">${signedPercent(item.discountPercent)}</strong></div></div>
       <div class="opportunity-track"><span class="${scoreClass}" style="width:${item.opportunityScore}%"></span></div>
-      <div class="price-zones"><div><span>Недавний P25</span><strong>${money(item.recentP25Unit ?? item.p25Unit)} ₽</strong></div><div><span>Адаптивная / 30 дней</span><strong>${money(item.fairValueUnit ?? item.medianUnit)} / ${money(item.medianUnit)} ₽</strong></div><div><span>Недавний P75</span><strong>${money(item.recentP75Unit ?? item.p75Unit)} ₽</strong></div></div>
-      <div class="insight-metrics"><div><span>Тренд 24ч</span><strong class="${trendClass}">${signedPercent(item.trendPercent)}</strong></div><div><span>Недавний разброс</span><strong>${signedPercent(item.volatilityPercent)}</strong></div><div><span>Продаж в день</span><strong>${item.salesPerDay == null ? "—" : item.salesPerDay.toFixed(1)}</strong></div><div><span>Свежая выборка</span><strong>${item.recentSalesSample}</strong></div><div><span>Ликвидность</span><strong>${escapeHtml(item.liquidity)}</strong></div><div><span>Активных / подходит</span><strong>${item.activeLots} / ${item.matchingLots}</strong></div></div>
+      <div class="price-zones"><div><span>Недавний P25 ${helpTip(helpText.percentile)}</span><strong>${money(item.recentP25Unit ?? item.p25Unit)} ₽</strong></div><div><span>Адаптивная / длинная ${helpTip(helpText.adaptivePrice)}</span><strong>${money(item.fairValueUnit ?? item.medianUnit)} / ${money(item.medianUnit)} ₽</strong></div><div><span>Недавний P75 ${helpTip(helpText.percentile)}</span><strong>${money(item.recentP75Unit ?? item.p75Unit)} ₽</strong></div></div>
+      <div class="insight-metrics"><div><span>Тренд 24ч ${helpTip(helpText.trend)}</span><strong class="${trendClass}">${signedPercent(item.trendPercent)}</strong></div><div><span>Недавний разброс ${helpTip(helpText.volatility)}</span><strong>${signedPercent(item.volatilityPercent)}</strong></div><div><span>Продаж в день ${helpTip(helpText.salesPerDay)}</span><strong>${item.salesPerDay == null ? "—" : item.salesPerDay.toFixed(1)}</strong></div><div><span>Свежая выборка ${helpTip(helpText.freshSample)}</span><strong>${item.recentSalesSample}</strong></div><div><span>Тип лотов ${helpTip("Пачки считаются уместными только после фактического наблюдения amount > 1. Экипировка и артефакты всегда считаются поштучными.")}</span><strong>${escapeHtml(stackabilityLabel(item))}</strong></div><div><span>Размер / активных ${helpTip("Размерная группа самого дешёвого лота; далее число предложений в группе и всего по варианту.")}</span><strong>${escapeHtml(item.comparisonAmountLabel)} · ${item.activeLots}/${item.allActiveLots}</strong></div></div>
       <div class="risk-row">${item.risks.length ? item.risks.map((risk) => `<span><i data-lucide="shield-alert"></i>${escapeHtml(risk)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Явных рисков нет</span>`}</div>
     </article>`;
   }).join("") || `<div class="analytics-empty"><i data-lucide="sparkles"></i><strong>${analyticsInsights.length ? "Нет сигналов по выбранным фильтрам" : "Рассчитайте рыночные сигналы"}</strong><span>${rules.length ? "Расчёт использует активные правила" : "Сначала добавьте хотя бы одно правило"}</span></div>`;
@@ -1033,35 +1283,108 @@ async function loadAnalytics() {
   try {
     const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules: analysisRules });
     analyticsInsights = response.insights;
-    try {
-      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all", qualities: [], minUpgrade: null, maxUpgrade: null });
-      recommendationMovements = movement.markets;
-    } catch { recommendationMovements = []; }
+    scannerInsights = response.insights;
     $("#analytics-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+    $("#scanner-updated").textContent = `Тот же расчёт · ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+    $("#scanner-updated").textContent = "Проверяю премию за крупные пачки...";
+    await loadAutomaticStackStrategies(response.insights);
+    $("#scanner-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · проверены обычная перепродажа и сборка пачек`;
     renderAnalytics();
+    renderScanner();
     $(".workspace").scrollTop = 0;
     await refreshCacheStatus();
   } catch (error) { toast(String(error), true); log(String(error), true); $("#analytics-updated").textContent = "Не удалось рассчитать аналитику"; }
   finally { $("#analytics-load").classList.remove("busy"); }
 }
 
+function insightKey(insight: MarketInsight) {
+  return `${insight.region}|${insight.itemId}|${insight.artifactQualities.join(",")}|${insight.minUpgrade ?? ""}|${insight.maxUpgrade ?? ""}`;
+}
+
+function inherentlySingleItem(insight: MarketInsight) {
+  const item = catalog.find((candidate) => candidate.id === insight.itemId);
+  const kind = `${item?.category || ""} ${item?.subcategory || ""}`.toLocaleLowerCase("ru");
+  const nonStackable = [
+    "weapon", "armor", "armour", "container", "artefact", "artifact", "backpack", "device",
+    "оруж", "брон", "контейнер", "артефакт", "рюкзак",
+  ];
+  return insight.artifactQualities.length > 0 || nonStackable.some((marker) => kind.includes(marker));
+}
+
+function stackabilityFor(insight: MarketInsight): MarketInsight["stackability"] {
+  return inherentlySingleItem(insight) ? "single" : insight.stackability;
+}
+
+function supportsStackStrategy(insight: MarketInsight) {
+  return stackabilityFor(insight) === "stackable";
+}
+
+function stackabilityLabel(insight: MarketInsight) {
+  const kind = stackabilityFor(insight);
+  if (kind === "stackable") return `Складывается · найдено пачек: ${insight.stackEvidence}`;
+  if (kind === "single") return "Только поштучно";
+  return "Пачки пока не подтверждены";
+}
+
+async function loadAutomaticStackStrategies(insights: MarketInsight[]) {
+  automaticStackStrategies = new Map();
+  const feePercent = Math.max(0, Math.min(50, numberValue("scanner-fee") ?? 5));
+  const candidates = insights.filter(supportsStackStrategy);
+  for (let index = 0; index < candidates.length; index += 4) {
+    const batch = candidates.slice(index, index + 4);
+    const results = await Promise.allSettled(batch.map((insight) => invoke<StackStrategyAnalysis>("stack_strategy_analysis", {
+      rule: analysisRuleForInsight(insight), buyMaxAmount: 9, sellMinAmount: 20,
+      targetAmount: 20, feePercent, maxBuyUnit: null,
+    })));
+    results.forEach((result, resultIndex) => {
+      if (result.status !== "fulfilled") return;
+      const strategy = result.value;
+      if (strategy.bulkSalesSample >= 5 && strategy.expectedSellUnit != null) {
+        automaticStackStrategies.set(insightKey(batch[resultIndex]), strategy);
+      }
+    });
+  }
+}
+
 function opportunityFor(insight: MarketInsight, feePercent: number, horizonDays: number): MarketOpportunity | undefined {
   const fairValue = insight.fairValueUnit ?? insight.medianUnit;
   if (insight.currentMinUnit == null || fairValue == null || insight.currentMinUnit <= 0 || fairValue <= 0) return undefined;
-  const movement = scannerMovements.find((item) => item.itemId === insight.itemId && item.region === insight.region);
   const volatility = Math.max(0, insight.volatilityPercent ?? 35);
   const negativeTrend = Math.max(0, -(insight.trendPercent ?? 0));
   const haircutPercent = Math.min(12, Math.max(2, volatility * .15) + Math.min(5, negativeTrend * .25));
-  const expectedSellPrice = fairValue * (1 - haircutPercent / 100);
-  const netSellPrice = expectedSellPrice * (1 - feePercent / 100);
-  const profitPerUnit = netSellPrice - insight.currentMinUnit;
-  const roiPercent = profitPerUnit / insight.currentMinUnit * 100;
+  let mode: MarketOpportunity["mode"] = "comparable";
+  let buyPrice = insight.currentMinUnit;
+  let expectedSellPrice = fairValue * (1 - haircutPercent / 100);
+  let netSellPrice = expectedSellPrice * (1 - feePercent / 100);
+  let profitPerUnit = netSellPrice - buyPrice;
+  let roiPercent = profitPerUnit / buyPrice * 100;
+  let purchaseAmount = insight.currentMinAmount ?? 1;
+  let purchaseLots = 1;
+  let sellAmountLabel = insight.comparisonAmountLabel;
+  const stackStrategy = automaticStackStrategies.get(insightKey(insight));
+  if (stackStrategy?.complete && stackStrategy.averageBuyUnit != null && stackStrategy.expectedSellUnit != null) {
+    const stackNetSell = stackStrategy.expectedSellUnit * (1 - feePercent / 100);
+    const stackProfitUnit = stackNetSell - stackStrategy.averageBuyUnit;
+    const stackRoi = stackProfitUnit / stackStrategy.averageBuyUnit * 100;
+    if (stackRoi > roiPercent) {
+      mode = "stack";
+      buyPrice = stackStrategy.averageBuyUnit;
+      expectedSellPrice = stackStrategy.expectedSellUnit;
+      netSellPrice = stackNetSell;
+      profitPerUnit = stackProfitUnit;
+      roiPercent = stackRoi;
+      purchaseAmount = stackStrategy.acquiredAmount;
+      purchaseLots = stackStrategy.purchaseLots;
+      sellAmountLabel = `${stackStrategy.sellMinAmount}+`;
+    }
+  }
 
   const dailyTurnoverPerLot = (insight.salesPerDay ?? 0) / Math.max(1, insight.activeLots);
   const sellThroughPercent = (1 - Math.exp(-dailyTurnoverPerLot * horizonDays)) * 100;
-  const sampleQuality = Math.min(1, insight.salesSample / 100);
-  const coverageQuality = movement ? Math.min(1, movement.coveragePercent / 100) : .35;
-  const collectionQuality = movement ? Math.min(1, movement.collections / 10) : .25;
+  const relevantSample = mode === "stack" ? stackStrategy!.bulkSalesSample : insight.salesSample;
+  const sampleQuality = Math.min(1, relevantSample / 100);
+  const coverageQuality = Math.min(1, insight.movementCoveragePercent / 100);
+  const collectionQuality = Math.min(1, insight.movementCollections / 10);
   const confidencePercent = (sampleQuality * .5 + coverageQuality * .3 + collectionQuality * .2) * 100;
   const confidence = confidencePercent >= 75 ? "Высокая" : confidencePercent >= 45 ? "Средняя" : "Низкая";
 
@@ -1069,16 +1392,22 @@ function opportunityFor(insight: MarketInsight, feePercent: number, horizonDays:
   const turnoverPoints = sellThroughPercent / 100 * 25;
   const confidencePoints = confidencePercent / 100 * 20;
   const stabilityPoints = Math.max(0, 10 - volatility / 5);
-  const supplyPenalty = Math.max(0, Math.min(10, ((movement?.supplyChangePercent ?? 0) - 15) / 4));
+  const supplyPenalty = Math.max(0, Math.min(10, ((insight.movementSupplyChangePercent ?? 0) - 15) / 4));
   const score = Math.round(Math.max(0, Math.min(100, roiPoints + turnoverPoints + confidencePoints + stabilityPoints - supplyPenalty)));
 
   const warnings = [...insight.risks];
-  if (haircutPercent >= 8) warnings.push("Цена выхода снижена из-за риска");
+  if (mode === "stack") warnings.push(`Сборка ${purchaseAmount} шт. из ${purchaseLots} дешёвых лотов`);
+  else if (haircutPercent >= 8) warnings.push("Цена выхода снижена из-за риска");
   if (sellThroughPercent < 35) warnings.push(`Вероятно долгая продажа: более ${horizonDays} дн.`);
-  if ((movement?.supplyChangePercent ?? 0) >= 20) warnings.push("Предложение быстро растёт");
+  if ((insight.movementSupplyChangePercent ?? 0) >= 20) warnings.push("Сопоставимое предложение быстро растёт");
   if (insight.medianUnit != null && Math.abs(fairValue / insight.medianUnit - 1) >= .1) warnings.push("Рынок сменил ценовой уровень");
   if (profitPerUnit <= 0) warnings.push("После расходов ожидается убыток");
-  return { insight, score, buyPrice: insight.currentMinUnit, expectedSellPrice, netSellPrice, profitPerUnit, roiPercent, sellThroughPercent, confidencePercent, confidence, warnings: [...new Set(warnings)] };
+  return {
+    insight, score, buyPrice, expectedSellPrice, netSellPrice, profitPerUnit, roiPercent,
+    sellThroughPercent, confidencePercent, confidence, warnings: [...new Set(warnings)],
+    mode, purchaseAmount, purchaseLots, sellAmountLabel,
+    stackStrategy: mode === "stack" ? stackStrategy : undefined,
+  };
 }
 
 function scannerOpportunities() {
@@ -1090,6 +1419,17 @@ function scannerOpportunities() {
 function insightVariantLabel(insight: MarketInsight) {
   const qualities = insight.artifactQualities.map((value) => artifactQualities.find((quality) => quality.value === value)?.label).filter(Boolean);
   return [...qualities, describeRange("заточка", insight.minUpgrade, insight.maxUpgrade, "+")].filter(Boolean).join(", ");
+}
+
+function analysisRuleForInsight(insight: MarketInsight): Rule {
+  return {
+    name: insight.name, itemId: insight.itemId, region: insight.region,
+    artifactQualities: insight.artifactQualities,
+    minAmount: insight.comparisonAmountMin,
+    maxAmount: insight.comparisonAmountMax,
+    minUpgrade: insight.minUpgrade, maxUpgrade: insight.maxUpgrade,
+    additional: true, historyLimit: 200, limit: 200, sort: "time_created", order: "desc",
+  };
 }
 
 function renderScanner() {
@@ -1116,11 +1456,23 @@ function renderScanner() {
     const targetBuy = roundRecommendationPrice(item.netSellPrice / (1 + Math.max(0, minRoi) / 100));
     const insightIndex = scannerInsights.indexOf(item.insight);
     const variant = insightVariantLabel(item.insight);
+    const isStack = item.mode === "stack";
+    const strategy = item.stackStrategy;
+    const stackability = stackabilityFor(item.insight);
+    const context = isStack
+      ? `сборка ${item.purchaseAmount} шт. из ${item.purchaseLots} лотов · продажа пачкой ${item.sellAmountLabel} · ${strategy?.bulkSalesSample ?? 0} крупных продаж`
+      : stackability === "single" ? `поштучный рынок · ${item.insight.salesSample} продаж`
+      : stackability === "unknown" ? `пачки не подтверждены · размер ${item.insight.comparisonAmountLabel} · ${item.insight.salesSample} продаж`
+      : `сопоставимые пачки ${item.insight.comparisonAmountLabel} · ${item.insight.salesSample} продаж`;
+    const buyNote = isStack ? `${item.purchaseLots} лотов · ${item.purchaseAmount} шт. суммарно` : `${item.insight.currentMinAmount ?? "—"} шт. в лоте`;
+    const sellNote = isStack
+      ? `пачки ${item.sellAmountLabel} · медиана ${money(strategy?.recentBulkMedianUnit)} ₽`
+      : `${stackability === "single" ? "поштучно" : `размер ${item.insight.comparisonAmountLabel}`} · последняя ${money(item.insight.latestSaleUnit)} ₽`;
     return `<article class="opportunity-card ${scoreClass}" data-opportunity-index="${insightIndex}" data-opportunity-id="${escapeHtml(item.insight.itemId)}" data-opportunity-region="${escapeHtml(item.insight.region)}" data-target-buy="${targetBuy}">
-      <header><span class="opportunity-rank">${index + 1}</span><div><strong>${escapeHtml(item.insight.name)}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)} · ${item.insight.salesSample} продаж${variant ? ` · ${escapeHtml(variant)}` : ""}</small></div><div class="opportunity-score ${scoreClass}"><strong>${item.score}</strong><span>из 100</span></div></header>
-      <div class="opportunity-prices"><div><span>Купить сейчас</span><strong>${money(item.buyPrice)} ₽</strong></div><i data-lucide="chevron-right"></i><div><span>Ожидаемая продажа</span><strong>${money(item.expectedSellPrice)} ₽</strong><small>адаптивная ${money(item.insight.fairValueUnit ?? item.insight.medianUnit)} ₽ · последняя ${money(item.insight.latestSaleUnit)} ₽</small></div><i data-lucide="chevron-right"></i><div><span>После расходов</span><strong>${money(item.netSellPrice)} ₽</strong></div></div>
-      <div class="opportunity-result"><div><span>Чистая прибыль / шт.</span><strong class="${roiClass}">${item.profitPerUnit >= 0 ? "+" : ""}${money(item.profitPerUnit)} ₽</strong></div><div><span>Доходность</span><strong class="${roiClass}">${signedPercent(item.roiPercent)}</strong></div><div><span>Реализация за ${horizon} дн.</span><strong>${item.sellThroughPercent.toFixed(0)}%</strong><small>оценка по обороту</small></div><div><span>Уверенность</span><strong>${item.confidence}</strong><small>${item.confidencePercent.toFixed(0)}% качества данных</small></div></div>
-      <footer><div class="opportunity-warnings">${item.warnings.length ? item.warnings.slice(0, 3).map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Критичных рисков не найдено</span>`}</div><div class="opportunity-actions"><button class="secondary scenario-open"><i data-lucide="gauge"></i> А что если?</button><button class="secondary scanner-rule"><i data-lucide="plus"></i> Правило ≤ ${money(targetBuy)} ₽</button></div></footer>
+      <header><span class="opportunity-rank">${index + 1}</span><div><strong>${escapeHtml(item.insight.name)}${isStack ? " · сборка пачки" : ""}</strong><small>${escapeHtml(item.insight.region)} · ${escapeHtml(item.insight.itemId)} · ${escapeHtml(context)}${variant ? ` · ${escapeHtml(variant)}` : ""}</small></div><div class="opportunity-score ${scoreClass}"><strong>${item.score}</strong><span>из 100 ${helpTip(helpText.opportunityScore)}</span></div></header>
+      <div class="opportunity-prices"><div><span>${isStack ? "Собрать сейчас" : "Купить сейчас"} ${helpTip(isStack ? "Средняя цена закупки всех малых лотов, необходимых для целевой пачки. Лоты берутся из последнего полного снимка рынка от дешёвых к дорогим." : "Самое дешёвое активное предложение нужного варианта. История выхода выбрана по его размерной группе.")}</span><strong>${money(item.buyPrice)} ₽/шт.</strong><small>${escapeHtml(buyNote)}</small></div><i data-lucide="chevron-right"></i><div><span>Ожидаемая продажа ${helpTip(isStack ? "Консервативная цена выхода по подтверждённым продажам крупных пачек. Она учитывает недавний уровень, тренд и разброс цены." : helpText.expectedSale)}</span><strong>${money(item.expectedSellPrice)} ₽/шт.</strong><small>${escapeHtml(sellNote)}</small></div><i data-lucide="chevron-right"></i><div><span>После расходов ${helpTip("Ожидаемая цена продажи за вычетом указанной комиссии и других расходов. Стоимость покупки вычитается уже в показателе чистой прибыли.")}</span><strong>${money(item.netSellPrice)} ₽/шт.</strong></div></div>
+      <div class="opportunity-result"><div><span>Чистая прибыль / шт. ${helpTip("Ожидаемая цена после расходов минус текущая цена покупки. Это модельный результат, пока лот фактически не продан.")}</span><strong class="${roiClass}">${item.profitPerUnit >= 0 ? "+" : ""}${money(item.profitPerUnit)} ₽</strong></div><div><span>Доходность ${helpTip("Чистая прибыль, делённая на стоимость покупки. Не учитывает альтернативную стоимость замороженного капитала.")}</span><strong class="${roiClass}">${signedPercent(item.roiPercent)}</strong></div><div><span>Реализация за ${horizon} дн. ${helpTip(helpText.sellThrough)}</span><strong>${item.sellThroughPercent.toFixed(0)}%</strong><small>оценка по обороту</small></div><div><span>Уверенность ${helpTip(helpText.confidence)}</span><strong>${item.confidence}</strong><small>${item.confidencePercent.toFixed(0)}% качества данных</small></div></div>
+      <footer><div class="opportunity-warnings">${item.warnings.length ? item.warnings.slice(0, 3).map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("") : `<span class="clear"><i data-lucide="shield-check"></i>Критичных рисков не найдено</span>`}</div><div class="opportunity-actions"><button class="secondary deep-analysis-open"><i data-lucide="bar-chart-3"></i> Разбор</button><button class="secondary scenario-open"><i data-lucide="gauge"></i> А что если?</button><button class="secondary ai-analysis-open"><i data-lucide="sparkles"></i> ИИ-разбор</button><button class="secondary scanner-rule"><i data-lucide="plus"></i> Правило ≤ ${money(targetBuy)} ₽</button></div></footer>
     </article>`;
   }).join("") || `<div class="scanner-empty"><i data-lucide="search-x"></i><strong>${scannerInsights.length ? "Нет сделок по заданным условиям" : "Запустите сканирование"}</strong><span>${scannerInsights.length ? "Снизьте минимальную доходность или измените регион" : "Сканер проверит предметы из активных правил"}</span></div>`;
   createIcons({ icons: appIcons });
@@ -1153,6 +1505,155 @@ function renderScenarioCalculation() {
     : `Безубыточная продажа: ${money(breakEven)} ₽/шт.${fairDelta == null ? "" : ` · ваша цена ${signedPercent(fairDelta)} к адаптивной цене`}`;
 }
 
+function aiList(title: string, values: string[], tone = "") {
+  if (!values.length) return "";
+  return `<section class="ai-list ${tone}"><h3>${escapeHtml(title)}</h3><ul>${values.map((value) => `<li>${escapeHtml(value)}</li>`).join("")}</ul></section>`;
+}
+
+function aiActionCategory(action: string): RecommendationAction | undefined {
+  const value = action.toLocaleLowerCase("ru");
+  if (/недостаточно|неопредел/.test(value)) return undefined;
+  if (/не покупать|ждать|наблюдать|воздерж/.test(value)) return "wait";
+  if (/продав/.test(value)) return "sell";
+  if (/держать|удерживать|придерж/.test(value)) return "hold";
+  if (/покуп|входить|брать/.test(value)) return "buy";
+  return undefined;
+}
+
+function renderAiAnalysis(analysis: AiMarketAnalysis, opportunity: MarketOpportunity) {
+  const program = recommendationFor(opportunity.insight);
+  const aiAction = aiActionCategory(analysis.action);
+  const comparable = aiAction != null;
+  const agrees = comparable && aiAction === program.action;
+  const comparison = !comparable ? "Вывод ИИ сформулирован неоднозначно"
+    : agrees ? "Независимые выводы совпали" : "Выводы расходятся — проверьте аргументы";
+  $("#ai-analysis-content").innerHTML = `
+    <section class="ai-verdict"><div><span>Вывод модели</span><strong>${escapeHtml(analysis.action)}</strong></div><p>${escapeHtml(analysis.summary)}</p></section>
+    <section class="ai-comparison ${comparable ? (agrees ? "agree" : "disagree") : "unclear"}"><div><span>Алгоритм программы</span><strong>${escapeHtml(program.title)}</strong><small>${escapeHtml(program.summary)}</small></div><div><span>Независимый ИИ-аудитор</span><strong>${escapeHtml(analysis.action)}</strong><small>${escapeHtml(comparison)}</small></div></section>
+    <section class="ai-scenario"><span>Основной сценарий</span><p>${escapeHtml(analysis.mainScenario)}</p></section>
+    <div class="ai-columns">${aiList("Что поддерживает идею", analysis.argumentsFor, "positive")}${aiList("Что может помешать", analysis.argumentsAgainst, "negative")}</div>
+    <div class="ai-columns">${aiList("Условия входа", analysis.entryConditions)}${aiList("Когда отказаться", analysis.cancellationConditions, "negative")}</div>
+    ${aiList("Каких данных не хватает", analysis.missingData, "muted")}
+    <p class="ai-disclaimer">ИИ не видел рекомендацию, целевые зоны, рейтинг возможности, ожидаемую продажу или ROI программы. Совпадение выводов не является гарантией сделки.</p>`;
+}
+
+function aiContext(opportunity: MarketOpportunity, deep?: MarketDeepAnalysis) {
+  const insight = opportunity.insight;
+  return {
+    task: "Независимо оценить покупку сейчас и дальнейшее действие, сформулировать условия входа и опровержения идеи",
+    contextPolicy: "Рекомендация, рейтинг, целевая зона, ожидаемая цена продажи и ROI алгоритма приложения намеренно не переданы",
+    item: {
+      name: insight.name, itemId: insight.itemId, region: insight.region,
+      variant: insightVariantLabel(insight) || "без варианта",
+      stackability: stackabilityFor(insight), comparisonAmount: insight.comparisonAmountLabel,
+    },
+    userConstraints: {
+      feePercent: Math.max(0, numberValue("scanner-fee") ?? 0),
+      horizonDays: Number($<HTMLSelectElement>("#scanner-horizon").value),
+    },
+    activeMarket: {
+      activeLots: insight.activeLots, currentMinUnit: insight.currentMinUnit,
+      currentMinAmount: insight.currentMinAmount,
+      currentMedianUnit: deep?.currentMedianUnit,
+      currentUnits: deep?.currentUnits,
+      supplyChangePercent: insight.movementSupplyChangePercent,
+      collectionCoveragePercent: insight.movementCoveragePercent, collections: insight.movementCollections,
+      depth: deep?.depth,
+    },
+    confirmedSales: {
+      totalSample: insight.salesSample, recent24hSample: insight.recentSalesSample,
+      latestSaleUnit: insight.latestSaleUnit, latestSaleAt: insight.latestSaleAt,
+      recentMedianUnit: insight.recentMedianUnit,
+      longMedianUnit: insight.medianUnit, p25Unit: insight.recentP25Unit, p75Unit: insight.recentP75Unit,
+      trendPercent24hVsPrevious24h: insight.trendPercent, volatilityPercent: insight.volatilityPercent,
+      salesPerDay: insight.salesPerDay, averageSaleIntervalMinutes: insight.averageSaleIntervalMinutes,
+      priceWindows: deep?.windows,
+      stackSegments: stackabilityFor(insight) === "stackable" ? deep?.stackSegments : undefined,
+    },
+    dataQuality: {
+      totalCollections: deep?.collections ?? insight.movementCollections,
+      completeCollections: deep?.completeCollections,
+      collectionCoveragePercent: insight.movementCoveragePercent,
+      recentSalesSample: insight.recentSalesSample,
+    },
+  };
+}
+
+async function runAiAnalysis() {
+  if (!aiOpportunity) return;
+  const endpoint = value("ai-endpoint");
+  const model = value("ai-model");
+  localStorage.setItem("stalzone-ai-endpoint", endpoint);
+  localStorage.setItem("stalzone-ai-model", model);
+  const button = $<HTMLButtonElement>("#ai-analyze");
+  button.disabled = true;
+  button.classList.add("busy");
+  $("#ai-analysis-content").innerHTML = `<div class="timing-loading"><span></span>Модель изучает факты и проверяет сценарии</div>`;
+  try {
+    let deep: MarketDeepAnalysis | undefined;
+    try {
+      deep = await invoke<MarketDeepAnalysis>("market_deep_analysis", {
+        rule: analysisRuleForInsight(aiOpportunity.insight),
+        feePercent: Math.max(0, numberValue("scanner-fee") ?? 0),
+      });
+    } catch {
+      // The independent review can still run on the compact market insight.
+    }
+    const analysis = await invoke<AiMarketAnalysis>("ai_market_analysis", {
+      endpoint, model, apiKey: value("ai-api-key") || null, context: aiContext(aiOpportunity, deep),
+    });
+    renderAiAnalysis(analysis, aiOpportunity);
+  } catch (error) {
+    $("#ai-analysis-content").innerHTML = `<div class="ai-error"><i data-lucide="triangle-alert"></i><div><strong>Не удалось получить ИИ-разбор</strong><p>${escapeHtml(String(error))}</p><small>Проверьте адрес, имя модели и API key. Для Ollama также убедитесь, что сервис запущен.</small></div></div>`;
+  } finally {
+    button.disabled = false;
+    button.classList.remove("busy");
+    createIcons({ icons: appIcons });
+  }
+}
+
+function openAiAnalysis(opportunity: MarketOpportunity) {
+  aiOpportunity = opportunity;
+  input("ai-endpoint").value = localStorage.getItem("stalzone-ai-endpoint") || "http://127.0.0.1:11434/api/chat";
+  input("ai-model").value = localStorage.getItem("stalzone-ai-model") || "gemma3:4b";
+  input("ai-api-key").value = "";
+  $("#ai-analysis-title").textContent = `${opportunity.insight.name} · ИИ-разбор`;
+  $("#ai-analysis-content").innerHTML = `<div class="timing-empty"><i data-lucide="sparkles"></i><strong>ИИ-разбор не запускается автоматически</strong><span>Проверьте настройки и нажмите «Анализировать». Без этого приложение работает как обычно.</span></div>`;
+  $<HTMLDialogElement>("#ai-analysis-dialog").showModal();
+  createIcons({ icons: appIcons });
+}
+
+function stackStrategyMarkup(strategy: StackStrategyAnalysis) {
+  const profitClass = (strategy.profit ?? 0) >= 0 ? "positive" : "negative";
+  return `<div class="stack-strategy-flow"><div><span>Закупка</span><strong>${strategy.purchaseLots} лотов · ${strategy.acquiredAmount} шт.</strong><small>средняя ${money(strategy.averageBuyUnit)} ₽ · всего ${money(strategy.totalCost)} ₽</small></div><i data-lucide="chevron-right"></i><div><span>Продажа пачкой</span><strong>${money(strategy.expectedSellUnit)} ₽/шт.</strong><small>медиана крупных продаж ${money(strategy.recentBulkMedianUnit)} ₽ · ${strategy.bulkSalesSample} сделок</small></div><i data-lucide="chevron-right"></i><div><span>После расходов</span><strong class="${profitClass}">${(strategy.profit ?? 0) >= 0 ? "+" : ""}${money(strategy.profit)} ₽</strong><small>ROI ${signedPercent(strategy.roiPercent)}</small></div></div><div class="stack-strategy-meta"><span>Доступно: ${strategy.availableLots} лотов / ${strategy.availableUnits} шт.</span><span>Точка безубыточности закупки: ${money(strategy.breakEvenBuyUnit)} ₽/шт.</span><span class="${strategy.complete ? "positive" : "negative"}">${strategy.complete ? "Пачку можно собрать сейчас" : "Товара для цели недостаточно"}</span></div>${strategy.warnings.length ? `<div class="opportunity-warnings">${strategy.warnings.map((warning) => `<span><i data-lucide="triangle-alert"></i>${escapeHtml(warning)}</span>`).join("")}</div>` : ""}`;
+}
+
+function renderStackStrategy(strategy: StackStrategyAnalysis) {
+  $("#stack-strategy-result").innerHTML = stackStrategyMarkup(strategy);
+  createIcons({ icons: appIcons });
+}
+
+async function loadStackStrategy() {
+  if (!scenarioOpportunity) return;
+  const button = $("#stack-strategy-calculate");
+  button.classList.add("busy");
+  $("#stack-strategy-result").innerHTML = `<div class="timing-loading"><span></span>Считаю сборку пачки</div>`;
+  try {
+    const strategy = await invoke<StackStrategyAnalysis>("stack_strategy_analysis", {
+      rule: analysisRuleForInsight(scenarioOpportunity.insight),
+      buyMaxAmount: Math.floor(numberValue("stack-buy-max-amount") ?? 9),
+      sellMinAmount: Math.floor(numberValue("stack-sell-min-amount") ?? 20),
+      targetAmount: Math.floor(numberValue("stack-target-amount") ?? 20),
+      feePercent: numberValue("scenario-fee") ?? 0,
+      maxBuyUnit: numberValue("stack-max-buy-unit") ?? null,
+    });
+    renderStackStrategy(strategy);
+  } catch (error) {
+    $("#stack-strategy-result").innerHTML = `<div class="timing-empty"><i data-lucide="triangle-alert"></i><strong>Не удалось рассчитать сборку</strong><span>${escapeHtml(String(error))}</span></div>`;
+    createIcons({ icons: appIcons });
+  } finally { button.classList.remove("busy"); }
+}
+
 function renderMarketTiming(timing: MarketTimingResponse) {
   const weekdays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
   $("#timing-sample").textContent = `${timing.totalSamples} полных снимков · ${timing.periodDays} дней`;
@@ -1170,6 +1671,8 @@ function renderMarketTiming(timing: MarketTimingResponse) {
 async function openScenario(opportunity: MarketOpportunity) {
   scenarioOpportunity = opportunity;
   const insight = opportunity.insight;
+  const stackable = supportsStackStrategy(insight);
+  $("#stack-strategy-section").classList.toggle("hidden", !stackable);
   $("#scenario-name").textContent = insight.name;
   $("#scenario-context").textContent = `${insight.region} · ${insight.itemId}${insightVariantLabel(insight) ? ` · ${insightVariantLabel(insight)}` : ""}`;
   $("#scenario-latest-sale").textContent = `${money(insight.latestSaleUnit)} ₽`;
@@ -1180,12 +1683,17 @@ async function openScenario(opportunity: MarketOpportunity) {
   $("#scenario-long-median").textContent = `${money(insight.medianUnit)} ₽`;
   input("scenario-buy").value = String(Math.round(opportunity.buyPrice));
   input("scenario-sell").value = String(Math.round(opportunity.expectedSellPrice));
-  input("scenario-amount").value = "1";
+  input("scenario-amount").value = String(opportunity.purchaseAmount);
   input("scenario-fee").value = String(numberValue("scanner-fee") ?? 0);
+  input("stack-buy-max-amount").value = String(opportunity.stackStrategy?.buyMaxAmount ?? 9);
+  input("stack-sell-min-amount").value = String(opportunity.stackStrategy?.sellMinAmount ?? 20);
+  input("stack-target-amount").value = String(opportunity.stackStrategy?.targetAmount ?? 20);
+  input("stack-max-buy-unit").value = "";
   renderScenarioCalculation();
   $("#timing-sample").textContent = "Загрузка...";
   $("#timing-content").innerHTML = `<div class="timing-loading"><span></span>Анализирую время наблюдений</div>`;
   $<HTMLDialogElement>("#scenario-dialog").showModal();
+  if (stackable) void loadStackStrategy();
   try {
     const timing = await invoke<MarketTimingResponse>("market_timing", {
       itemId: insight.itemId,
@@ -1202,25 +1710,46 @@ async function openScenario(opportunity: MarketOpportunity) {
   }
 }
 
-async function loadScanner() {
-  if (!rules.length) { toast("Для сканера нужно хотя бы одно активное правило", true); return; }
-  $("#scanner-load").classList.add("busy");
-  $("#scanner-updated").textContent = `Проверяю рынки: ${expandedRules().length}`;
+function renderDeepAnalysis(analysis: MarketDeepAnalysis, stackStrategy?: StackStrategyAnalysis) {
+  const maxDepth = Math.max(1, ...analysis.depth.map((level) => level.units));
+  const coverage = analysis.collections ? `${(analysis.completeCollections / analysis.collections * 100).toFixed(0)}%` : "—";
+  const windows = analysis.windows.map((window) => `<tr><td>${window.hours} ч.</td><td>${window.sales.toLocaleString("ru-RU")}</td><td>${window.units.toLocaleString("ru-RU")}</td><td>${money(window.p25Unit)} ₽</td><td><strong>${money(window.medianUnit)} ₽</strong></td><td>${money(window.p75Unit)} ₽</td></tr>`).join("");
+  const stacks = analysis.stackSegments.map((segment) => `<tr><td>${escapeHtml(segment.label)}</td><td>${segment.sales.toLocaleString("ru-RU")}</td><td>${segment.units.toLocaleString("ru-RU")}</td><td><strong>${money(segment.medianUnit)} ₽</strong></td></tr>`).join("");
+  const depth = analysis.depth.map((level) => `<div class="deep-depth-row"><div><strong>≤ ${money(level.price)} ₽</strong><small>${level.lots} лотов · ${level.units.toLocaleString("ru-RU")} шт.</small></div><span><i style="width:${Math.max(2, level.units / maxDepth * 100)}%"></i></span></div>`).join("");
+  $("#deep-analysis-content").innerHTML = `
+    <section class="deep-summary"><div><span>Продаж в выборке</span><strong>${analysis.totalSales.toLocaleString("ru-RU")}</strong><small>${analysis.soldUnits.toLocaleString("ru-RU")} единиц</small></div><div><span>Период данных</span><strong>${formatInterval(analysis.historyHours * 60)}</strong><small>до 30 дней, максимум 20 000 строк</small></div><div><span>Текущее предложение</span><strong>${analysis.currentSupply.toLocaleString("ru-RU")}</strong><small>${analysis.currentUnits.toLocaleString("ru-RU")} единиц</small></div><div><span>Полнота снимков</span><strong>${coverage}</strong><small>${analysis.completeCollections} из ${analysis.collections}</small></div></section>
+    <section class="deep-insights">${analysis.insights.map((insight) => `<div><i data-lucide="sparkles"></i><span>${escapeHtml(insight)}</span></div>`).join("") || `<div><span>Недостаточно данных для устойчивых выводов</span></div>`}</section>
+    <section class="deep-targets"><div><span>Консервативная продажа</span><strong>${money(analysis.expectedSellUnit)} ₽/шт.</strong></div><div><span>Покупка для 5% ROI</span><strong>${money(analysis.buyForFivePercent)} ₽/шт.</strong></div><div><span>Покупка для 10% ROI</span><strong>${money(analysis.buyForTenPercent)} ₽/шт.</strong></div><div><span>Предложение за 24ч</span><strong class="${(analysis.supplyChangePercent ?? 0) > 0 ? "negative" : "positive"}">${signedPercent(analysis.supplyChangePercent)}</strong></div></section>
+    <section class="deep-grid${stackStrategy ? "" : " single"}"><div class="deep-table"><header><div><span class="eyebrow">Исполненные сделки</span><h3>Динамика цены</h3></div><small>P25 · медиана · P75</small></header><div><table><thead><tr><th>Окно</th><th>Сделок</th><th>Единиц</th><th>P25</th><th>Медиана</th><th>P75</th></tr></thead><tbody>${windows}</tbody></table></div></div>${stackStrategy ? `<div class="deep-table"><header><div><span class="eyebrow">Последние 24 часа</span><h3>Размер пачки</h3></div><small>Цена за штуку</small></header><div><table><thead><tr><th>Количество</th><th>Сделок</th><th>Единиц</th><th>Медиана</th></tr></thead><tbody>${stacks}</tbody></table></div></div>` : ""}</section>
+    <section class="deep-depth"><header><div><span class="eyebrow">Последний полный снимок</span><h3>Глубина предложения</h3></div><small>Минимум ${money(analysis.currentMinUnit)} ₽ · медиана ${money(analysis.currentMedianUnit)} ₽</small></header><div>${depth || "Нет активных предложений по условиям правила"}</div></section>${stackStrategy ? `<section class="deep-stack-strategy"><header><div><span class="eyebrow">Премия за размер</span><h3>Сборка пачки ${stackStrategy.targetAmount} шт.</h3></div><small>покупаем лоты до ${stackStrategy.buyMaxAmount} · сравниваем с продажами от ${stackStrategy.sellMinAmount}</small></header>${stackStrategyMarkup(stackStrategy)}</section>` : ""}`;
+  createIcons({ icons: appIcons });
+}
+
+async function openDeepAnalysis(opportunity: MarketOpportunity) {
+  const insight = opportunity.insight;
+  $("#deep-analysis-title").textContent = `${insight.name} · разбор рынка`;
+  $("#deep-analysis-content").innerHTML = `<div class="timing-loading"><span></span>Считаю структуру рынка</div>`;
+  $<HTMLDialogElement>("#deep-analysis-dialog").showModal();
+  const rule = analysisRuleForInsight(insight);
   try {
-    const response = await invoke<MarketAnalyticsResponse>("market_analytics", { rules: expandedRules() });
-    scannerInsights = response.insights;
-    analyticsInsights = response.insights;
-    try {
-      const movement = await invoke<MarketMovementResponse>("market_movement", { hours: 24, region: "all", qualities: [], minUpgrade: null, maxUpgrade: null });
-      scannerMovements = movement.markets;
-      recommendationMovements = movement.markets;
-    } catch { scannerMovements = []; }
-    $("#scanner-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · ${scannerInsights.length} рынков`;
-    renderScanner();
-    await refreshCacheStatus();
+    const feePercent = numberValue("scanner-fee") ?? 0;
+    const stackable = supportsStackStrategy(insight);
+    const [analysis, stackStrategy] = await Promise.all([
+      invoke<MarketDeepAnalysis>("market_deep_analysis", { rule, feePercent }),
+      stackable ? invoke<StackStrategyAnalysis>("stack_strategy_analysis", { rule, buyMaxAmount: 9, sellMinAmount: 20, targetAmount: 20, feePercent, maxBuyUnit: null }) : Promise.resolve(undefined),
+    ]);
+    renderDeepAnalysis(analysis, stackStrategy);
   } catch (error) {
-    toast(String(error), true); log(String(error), true); $("#scanner-updated").textContent = "Не удалось выполнить сканирование";
-  } finally { $("#scanner-load").classList.remove("busy"); }
+    $("#deep-analysis-content").innerHTML = `<div class="timing-empty"><i data-lucide="triangle-alert"></i><strong>Не удалось построить разбор</strong><span>${escapeHtml(String(error))}</span></div>`;
+    createIcons({ icons: appIcons });
+  }
+}
+
+async function loadScanner() {
+  if (!rules.length) { toast("Для советника нужно хотя бы одно активное правило", true); return; }
+  $("#scanner-load").classList.add("busy");
+  await loadAnalytics();
+  $("#scanner-load").classList.remove("busy");
 }
 
 function movementKey(market: MarketMovement) {
@@ -1237,6 +1766,14 @@ function movementSignalClass(signal: string) {
   if (signal.includes("Перенасыщение")) return "oversupply";
   if (signal.includes("больше")) return "pending";
   return "stable";
+}
+
+function movementSignalHelp(signal: string) {
+  if (signal.includes("Дефицит")) return "Активных лотов стало минимум на 10% меньше, а медиана предложений выросла минимум на 5%. Для владельца это благоприятно; покупателю важно проверить, растёт ли также красная линия продаж.";
+  if (signal.includes("Перенасыщение")) return "Активных лотов стало минимум на 15% больше, а медиана предложений упала минимум на 5%. Продавцы конкурируют, поэтому покупателю часто выгоднее дождаться стабилизации.";
+  if (signal.includes("исчезают")) return "За период исчезло больше лотов, чем появилось, и медиана предложений выросла. Это может означать спрос, но исчезновение без сопоставленной продажи не является доказанной сделкой.";
+  if (signal.includes("больше данных")) return "Есть меньше двух снимков рынка. Изменение предложения и цены пока невозможно оценить надёжно.";
+  return "Ни одно сильное условие дефицита или перенасыщения не выполнено. Это не означает, что цена совершенно неподвижна.";
 }
 
 function renderMovementChart(market: MarketMovement) {
@@ -1268,6 +1805,13 @@ function renderMovementChart(market: MarketMovement) {
     });
     price.setData(pricePoints);
   }
+  if (market.salePoints.length) {
+    const sales = movementChart.addSeries(LineSeries, {
+      color: "#ef7169", lineWidth: 2, priceScaleId: "right", pointMarkersVisible: market.salePoints.length < 120,
+      priceLineVisible: false, priceFormat: { type: "custom", formatter: (value: number) => `${money(value)} ₽` },
+    });
+    sales.setData(market.salePoints.map((point) => ({ time: point.time as UTCTimestamp, value: point.medianUnit })));
+  }
   movementChart.timeScale().fitContent();
   movementResizeObserver = new ResizeObserver(() => {
     if (movementChart && container.clientWidth > 0) movementChart.applyOptions({ width: container.clientWidth });
@@ -1289,10 +1833,10 @@ function renderMovementDetail(market?: MarketMovement) {
     return `<tr><td><span class="movement-event ${event.kind}">${labels[event.kind]}${confidence}</span></td><td>${escapeHtml(new Date(event.time).toLocaleString("ru-RU"))}</td><td>${escapeHtml(variant)}</td><td>${event.amount.toLocaleString("ru-RU")}</td><td>${money(event.unitPrice)} ₽</td><td>${event.lifetimeMinutes == null ? "—" : formatInterval(event.lifetimeMinutes)}</td></tr>`;
   }).join("") || `<tr><td colspan="6" class="table-empty">За период событий пока нет</td></tr>`;
   $("#movement-detail").innerHTML = `
-    <header class="movement-detail-head"><div><span class="rule-region">${escapeHtml(market.region)}</span><div><h3>${escapeHtml(movementItemName(market.itemId))}</h3><small>${escapeHtml(market.itemId)} · последнее наблюдение ${escapeHtml(new Date(market.lastCollected).toLocaleString("ru-RU"))}</small></div></div><span class="movement-signal ${signalClass}">${escapeHtml(market.signal)}</span></header>
-    <div class="movement-metrics"><div><span>Предложение</span><strong>${market.currentSupply.toLocaleString("ru-RU")}</strong><small class="${(market.supplyChangePercent ?? 0) > 0 ? "negative" : "positive"}">${signedPercent(market.supplyChangePercent)}</small></div><div><span>Медиана / шт.</span><strong>${money(market.currentMedianUnit)} ₽</strong><small class="${(market.priceChangePercent ?? 0) > 0 ? "positive" : "negative"}">${signedPercent(market.priceChangePercent)}</small></div><div><span>Минимум / шт.</span><strong>${money(market.currentMinUnit)} ₽</strong><small>${market.collections} проходов</small></div><div><span>Среднее время жизни</span><strong>${formatInterval(market.averageLifetimeMinutes)}</strong><small>исчезнувшие и завершённые</small></div></div>
-    <div class="movement-quality"><div><span>Официальных продаж</span><strong>${market.officialSales.toLocaleString("ru-RU")}</strong></div><div><span>Вероятно сопоставлено</span><strong>${market.probableSales.toLocaleString("ru-RU")}</strong></div><div><span>Необъяснённо исчезло</span><strong>${market.unexplainedMissing.toLocaleString("ru-RU")}</strong></div><div><span>Полнота обходов</span><strong>${market.coveragePercent.toFixed(0)}%</strong></div></div>
-    <div class="movement-chart-head"><div><span><i class="supply"></i>Предложение</span><span><i class="price"></i>Медианная цена</span></div><small>Покрытие ${market.coveragePercent.toFixed(0)}%</small></div>
+    <header class="movement-detail-head"><div><span class="rule-region">${escapeHtml(market.region)}</span><div><h3>${escapeHtml(movementItemName(market.itemId))}</h3><small>${escapeHtml(market.itemId)} · последнее наблюдение ${escapeHtml(new Date(market.lastCollected).toLocaleString("ru-RU"))}</small></div></div><div class="movement-status-wrap"><span class="movement-signal ${signalClass}">${escapeHtml(market.signal)}</span>${helpTip(movementSignalHelp(market.signal), `Что означает статус ${market.signal}`)}</div></header>
+    <div class="movement-metrics"><div><span>Предложение ${helpTip(helpText.supply)}</span><strong>${market.currentSupply.toLocaleString("ru-RU")}</strong><small class="${(market.supplyChangePercent ?? 0) > 0 ? "negative" : "positive"}">${signedPercent(market.supplyChangePercent)}</small></div><div><span>Медиана / шт. ${helpTip(helpText.askMedian)}</span><strong>${money(market.currentMedianUnit)} ₽</strong><small class="${(market.priceChangePercent ?? 0) > 0 ? "positive" : "negative"}">${signedPercent(market.priceChangePercent)}</small></div><div><span>Минимум / шт. ${helpTip(helpText.askMinimum)}</span><strong>${money(market.currentMinUnit)} ₽</strong><small>${market.collections} проходов</small></div><div><span>Среднее время жизни ${helpTip(helpText.lifetime)}</span><strong>${formatInterval(market.averageLifetimeMinutes)}</strong><small>исчезнувшие и завершённые</small></div></div>
+    <div class="movement-quality"><div><span>Продаж в истории ${helpTip(helpText.recordedSales)}</span><strong>${market.recordedSales.toLocaleString("ru-RU")}</strong><small>STALZONE ${market.stalzoneSales.toLocaleString("ru-RU")} · SCHistory ${market.schistorySales.toLocaleString("ru-RU")}</small></div><div><span>Вероятно сопоставлено ${helpTip(helpText.probableSales)}</span><strong>${market.probableSales.toLocaleString("ru-RU")}</strong></div><div><span>Необъяснённо исчезло ${helpTip(helpText.missing)}</span><strong>${market.unexplainedMissing.toLocaleString("ru-RU")}</strong></div><div><span>Полнота обходов ${helpTip(helpText.coverage)}</span><strong>${market.coveragePercent.toFixed(0)}%</strong></div></div>
+    <div class="movement-chart-head"><div><span><i class="supply"></i>Предложение</span><span><i class="price"></i>Медиана предложений</span><span><i class="sales"></i>Медиана продаж</span></div><small>Полнота снимков ${market.coveragePercent.toFixed(0)}% ${helpTip(helpText.coverage)}</small></div>
     <div id="movement-chart"></div>
     <div class="movement-events"><div class="movement-section-title"><strong>Последние события</strong><span>Исчезновение не гарантирует продажу</span></div><div class="movement-events-scroll"><table><thead><tr><th>Событие</th><th>Время</th><th>Вариант</th><th>Количество</th><th>Цена / шт.</th><th>Время жизни</th></tr></thead><tbody>${events}</tbody></table></div></div>`;
   renderMovementChart(market);
@@ -1316,17 +1860,36 @@ function renderMovement() {
   if (!visibleMarkets.some((market) => movementKey(market) === selectedMovementKey)) selectedMovementKey = visibleMarkets[0] && movementKey(visibleMarkets[0]);
   $("#movement-list").innerHTML = visibleMarkets.map((market) => {
     const key = movementKey(market);
-    return `<button class="movement-market${key === selectedMovementKey ? " active" : ""}" data-item-id="${escapeHtml(market.itemId)}" data-region="${escapeHtml(market.region)}"><div><span class="rule-region">${escapeHtml(market.region)}</span><strong>${escapeHtml(movementItemName(market.itemId))}</strong></div><small>${market.currentSupply.toLocaleString("ru-RU")} лотов · ${market.officialSales.toLocaleString("ru-RU")} продаж · медиана ${money(market.currentMedianUnit)} ₽</small><span class="movement-signal ${movementSignalClass(market.signal)}">${escapeHtml(market.signal)}</span></button>`;
+    return `<button class="movement-market${key === selectedMovementKey ? " active" : ""}" data-item-id="${escapeHtml(market.itemId)}" data-region="${escapeHtml(market.region)}"><div><span class="rule-region">${escapeHtml(market.region)}</span><strong>${escapeHtml(movementItemName(market.itemId))}</strong></div><small>${market.currentSupply.toLocaleString("ru-RU")} лотов · ${market.recordedSales.toLocaleString("ru-RU")} продаж · медиана ${money(market.currentMedianUnit)} ₽</small><span class="movement-signal ${movementSignalClass(market.signal)}">${escapeHtml(market.signal)}</span></button>`;
   }).join("") || `<div class="movement-empty">${movementMarkets.length ? "Ничего не найдено" : "Нет данных за выбранный период"}</div>`;
   renderMovementDetail(visibleMarkets.find((market) => movementKey(market) === selectedMovementKey));
+}
+
+function applyMovementAmountPreset() {
+  const preset = $<HTMLSelectElement>("#movement-amount-preset").value;
+  const ranges: Record<string, [string, string]> = {
+    all: ["", ""], "1": ["1", "1"], "2-4": ["2", "4"], "5-9": ["5", "9"],
+    "10-19": ["10", "19"], "20-49": ["20", "49"], "50+": ["50", ""],
+  };
+  const range = ranges[preset];
+  if (range) {
+    input("movement-min-amount").value = range[0];
+    input("movement-max-amount").value = range[1];
+  }
 }
 
 async function loadMovement() {
   const qualities = [...document.querySelectorAll<HTMLInputElement>("#movement-quality-options input:checked")].map((checkbox) => checkbox.value);
   const minUpgrade = numberValue("movement-min-upgrade");
   const maxUpgrade = numberValue("movement-max-upgrade");
+  const minAmount = numberValue("movement-min-amount");
+  const maxAmount = numberValue("movement-max-amount");
   if (minUpgrade != null && maxUpgrade != null && minUpgrade > maxUpgrade) {
     toast("Минимальная заточка не может быть больше максимальной", true);
+    return;
+  }
+  if (minAmount != null && maxAmount != null && minAmount > maxAmount) {
+    toast("Минимальное количество не может быть больше максимального", true);
     return;
   }
   $("#movement-load").classList.add("busy");
@@ -1337,10 +1900,12 @@ async function loadMovement() {
       qualities,
       minUpgrade: minUpgrade ?? null,
       maxUpgrade: maxUpgrade ?? null,
+      minAmount: minAmount ?? null,
+      maxAmount: maxAmount ?? null,
     });
     movementMarkets = response.markets;
     const qualityLabels = qualities.map((value) => artifactQualities.find((quality) => quality.value === value)?.label).filter(Boolean);
-    const variant = [...qualityLabels, describeRange("заточка", minUpgrade, maxUpgrade, "+")].filter(Boolean).join(", ");
+    const variant = [...qualityLabels, describeRange("заточка", minUpgrade, maxUpgrade, "+"), describeRange("лот", minAmount, maxAmount)].filter(Boolean).join(", ");
     $("#movement-updated").textContent = `Обновлено ${new Date(response.generatedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} · ${variant || "все варианты"}`;
     renderMovement();
   } catch (error) { toast(String(error), true); log(String(error), true); }
@@ -1365,9 +1930,11 @@ function setForm(rule?: Rule) {
   input("category-item-search").value = "";
   updateRuleCategoryOptions(rule?.category);
   $<HTMLSelectElement>("#category-top").value = String(rule?.topN || 1);
+  input("rapid-monitor").checked = Boolean(rule?.rapidMonitor);
+  input("rapid-interval").value = String(rule?.rapidIntervalSeconds || 5);
   renderRuleScope();
   const fields: [string, string | number | undefined][] = [
-    ["rule-name", rule?.name], ["item-id", rule?.itemId], ["max-buyout", rule?.maxBuyout], ["max-unit", rule?.maxUnitBuyout], ["min-amount", rule?.minAmount],
+    ["rule-name", rule?.name], ["item-id", rule?.itemId], ["max-buyout", rule?.maxBuyout], ["max-unit", rule?.maxUnitBuyout], ["min-amount", rule?.minAmount], ["max-amount", rule?.maxAmount],
     ["min-upgrade", rule?.minUpgrade], ["max-upgrade", rule?.maxUpgrade],
     ["history-percent", rule?.maxHistoryMedianRatio == null ? undefined : rule.maxHistoryMedianRatio * 100],
     ["current-percent", rule?.maxCurrentMinRatio == null ? undefined : rule.maxCurrentMinRatio * 100],
@@ -1379,6 +1946,7 @@ function setForm(rule?: Rule) {
   const selectedQualities = rule?.artifactQualities?.length ? rule.artifactQualities : legacyQualities;
   document.querySelectorAll<HTMLInputElement>("#quality-options input").forEach((checkbox) => checkbox.checked = selectedQualities.includes(checkbox.value as ArtifactQuality));
   if (rule) $<HTMLSelectElement>("#region").value = rule.region;
+  renderRapidRuleControls();
   $("#upsert").innerHTML = `<i data-lucide="${rule ? "save" : "check"}"></i> ${rule ? "Сохранить изменения" : "Добавить правило"}`;
   createIcons({ icons: appIcons });
 }
@@ -1388,6 +1956,7 @@ async function persistRules(showToast = true) {
   const path = await invoke<string>("save_rules", { payload: { defaults: { region, limit: 50, sort: "time_created", order: "desc", additional: true }, items: rules } });
   if (showToast) toast("Правила сохранены");
   log(`Конфигурация сохранена: ${path}`);
+  if (monitorTimer != null) resetRapidSchedule();
 }
 
 function renderMatches() {
@@ -1440,23 +2009,98 @@ async function runCheck(manual = false) {
   }
 }
 
+function rapidRuleKey(rule: Rule, index: number) {
+  return `${index}|${rule.region}|${rule.itemId}|${rule.category || ""}|${rule.name}`;
+}
+
+function rapidRulesExpandedCount() {
+  return expandedRules(rules.filter((rule) => rule.rapidMonitor)).length;
+}
+
+async function runRapidCheck(baseline = false) {
+  if (baseline) rapidBaselinePending = true;
+  if (rapidChecking || rapidBackoffUntil > Date.now()) return;
+  baseline = baseline || rapidBaselinePending;
+  const enabled = rules.map((rule, index) => ({ rule, index })).filter(({ rule }) => rule.rapidMonitor);
+  if (!enabled.length) return;
+  const now = Date.now();
+  const due = baseline ? enabled : enabled.filter(({ rule, index }) => (rapidNextDue.get(rapidRuleKey(rule, index)) ?? 0) <= now);
+  if (!due.length) return;
+  due.forEach(({ rule, index }) => rapidNextDue.set(rapidRuleKey(rule, index), now + Math.max(3, Math.min(10, rule.rapidIntervalSeconds || 5)) * 1000));
+  rapidChecking = true;
+  try {
+    const rapidRules = expandedRules(due.map(({ rule }) => rule));
+    const result = await invoke<RapidCheckResult>("rapid_check_rules", { rules: rapidRules, baseline });
+    if (baseline) rapidBaselinePending = false;
+    if (result.throttled) {
+      rapidBackoffUntil = Math.max(Date.now() + 3_000, (result.rateResetAt || 0) + 250);
+      log(`Оперативный мониторинг ждёт лимит API до ${new Date(rapidBackoffUntil).toLocaleTimeString("ru-RU")}`);
+    }
+    result.errors.forEach((error) => log(`Оперативный мониторинг: ${error}`, true));
+    if (result.matches.length) {
+      const combined = [...result.matches, ...matches];
+      matches = combined.filter((match, index) => combined.findIndex((candidate) =>
+        candidate.itemId === match.itemId && candidate.region === match.region &&
+        candidate.end === match.end && candidate.buyout === match.buyout && candidate.amount === match.amount
+      ) === index).slice(0, 100);
+      renderMatches();
+      result.matches.forEach((match) => { void desktopNotify(match); });
+      toast(`Оперативно найдено лотов: ${result.matches.length}`);
+      log(`Оперативно: новых лотов ${result.newLots}, совпадений ${result.matches.length}`);
+    }
+    const rate = result.rateRemaining == null ? "" : ` · API ${result.rateRemaining}/${result.rateLimit ?? "—"}`;
+    $("#overview-mode").textContent = `обычный сбор + оперативный поиск${rate}`;
+    if (baseline) log(`Оперативный мониторинг подготовлен: ${result.checkedRules} рынков, текущие лоты приняты за базу`);
+  } catch (error) {
+    log(`Оперативный мониторинг: ${String(error)}`, true);
+    rapidBackoffUntil = Date.now() + 5_000;
+  } finally {
+    rapidChecking = false;
+    if (rapidBaselinePending) window.setTimeout(() => void runRapidCheck(true), 0);
+  }
+}
+
+function resetRapidSchedule() {
+  rapidNextDue.clear();
+  rapidBackoffUntil = 0;
+  const rapidMarkets = rapidRulesExpandedCount();
+  if (monitorTimer == null || !rapidMarkets) {
+    if (rapidMonitorTimer != null) clearInterval(rapidMonitorTimer);
+    rapidMonitorTimer = undefined;
+    return;
+  }
+  if (rapidMonitorTimer == null) rapidMonitorTimer = window.setInterval(() => void runRapidCheck(), 500);
+  void runRapidCheck(true);
+}
+
 function toggleMonitor() {
   const button = $("#monitor-toggle");
   if (monitorTimer != null) {
     clearInterval(monitorTimer); monitorTimer = undefined;
+    if (rapidMonitorTimer != null) clearInterval(rapidMonitorTimer);
+    rapidMonitorTimer = undefined;
+    rapidNextDue.clear();
+    rapidBackoffUntil = 0;
+    rapidBaselinePending = false;
     nextCheckAt = undefined;
     $("#pulse").classList.remove("active"); $("#monitor-label").textContent = "Остановлен";
     $("#overview-mode").textContent = "мониторинг выключен";
     button.innerHTML = `<i data-lucide="play"></i> Запустить`; log("Мониторинг остановлен");
   } else {
+    const rapidMarkets = rapidRulesExpandedCount();
+    if (rapidMarkets > 15) { toast(`В оперативном мониторинге ${rapidMarkets} предметов. Оставьте не более 15.`, true); return; }
     const minimum = rules.some((rule) => rule.scope === "category") ? 300 : 10;
     const seconds = Math.max(minimum, numberValue("interval") || 60);
     input("interval").value = String(seconds);
     void runCheck();
     monitorTimer = window.setInterval(() => void runCheck(), seconds * 1000);
+    if (rapidMarkets) {
+      void runRapidCheck(true);
+      rapidMonitorTimer = window.setInterval(() => void runRapidCheck(), 500);
+    }
     nextCheckAt = Date.now() + seconds * 1000;
     $("#pulse").classList.add("active"); $("#monitor-label").textContent = `Активен · ${seconds} сек`;
-    $("#overview-mode").textContent = `автоматически каждые ${seconds} сек`;
+    $("#overview-mode").textContent = rapidMarkets ? `полный сбор ${seconds} сек · оперативно 3–10 сек` : `автоматически каждые ${seconds} сек`;
     button.innerHTML = `<i data-lucide="square"></i> Остановить`; log(`Мониторинг запущен, интервал ${seconds} сек`);
   }
   createIcons({ icons: appIcons });
@@ -1483,6 +2127,8 @@ $("#rule-scope").addEventListener("click", (event) => {
   ruleScope = button.dataset.value as "item" | "category";
   renderRuleScope();
 });
+input("rapid-monitor").addEventListener("change", renderRapidRuleControls);
+input("rapid-interval").addEventListener("input", renderRapidRuleControls);
 $("#rule-category").addEventListener("change", () => {
   categorySelectedIds.clear();
   input("category-item-search").value = "";
@@ -1518,6 +2164,7 @@ $("#upsert").addEventListener("click", () => {
     ruleSummaries = ruleSummaries.filter((summary) => !(summary.itemId === rule.itemId && summary.region === rule.region));
     analyticsInsights = [];
     scannerInsights = [];
+    automaticStackStrategies.clear();
     if (editingIndex != null) rules[editingIndex] = rule;
     else { const duplicate = rules.findIndex((entry) => ruleTargetLabel(entry) === ruleTargetLabel(rule) && entry.region === rule.region); if (duplicate >= 0) rules[duplicate] = rule; else rules.push(rule); }
     editingIndex = undefined; setForm(); renderRules(); void persistRules(false); toast("Правило добавлено");
@@ -1526,7 +2173,7 @@ $("#upsert").addEventListener("click", () => {
 $("#rules-list").addEventListener("click", (event) => {
   const row = (event.target as HTMLElement).closest<HTMLElement>("[data-index]"); if (!row) return;
   const index = Number(row.dataset.index);
-  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; const removedIds = new Set(removed.itemIds || [removed.itemId]); rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(removedIds.has(summary.itemId) && summary.region === removed.region)); analyticsInsights = []; scannerInsights = []; editingIndex = undefined; renderRules(); renderAnalytics(); renderScanner(); void persistRules(false); return; }
+  if ((event.target as HTMLElement).closest(".delete-rule")) { const removed = rules[index]; const removedIds = new Set(removed.itemIds || [removed.itemId]); rules.splice(index, 1); ruleSummaries = ruleSummaries.filter((summary) => !(removedIds.has(summary.itemId) && summary.region === removed.region)); analyticsInsights = []; scannerInsights = []; automaticStackStrategies.clear(); editingIndex = undefined; renderRules(); renderAnalytics(); renderScanner(); void persistRules(false); return; }
   editingIndex = index; setForm(rules[index]); renderRules(); $(".rule-editor").scrollIntoView({ behavior: "smooth" });
 });
 $("#save").addEventListener("click", () => void persistRules());
@@ -1546,15 +2193,27 @@ $("#overview-check").addEventListener("click", () => void runCheck(true));
 $(".workspace-tabs").addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-view]"); if (!button) return;
   const view = button.dataset.view as WorkspaceView;
-  if (view === "history" && selected && historyItem?.id !== selected.id) openHistory(selected); else switchView(view);
+  if (view === "history" && selected && historyItem?.id !== selected.id) openHistory(selected);
+  else if (view === "analytics") switchAdvisorSection("decisions");
+  else switchView(view);
   if (view === "analytics" && !analyticsInsights.length && rules.length) void loadAnalytics();
-  if (view === "scanner" && !scannerInsights.length && rules.length) void loadScanner();
   if (view === "movement" && !movementMarkets.length) void loadMovement();
 });
+document.querySelectorAll<HTMLElement>(".advisor-tabs").forEach((navigation) => navigation.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-advisor]");
+  if (!button) return;
+  switchAdvisorSection(button.dataset.advisor as AdvisorSection);
+  if (!analyticsInsights.length && rules.length) void loadAnalytics();
+}));
 $("#market-rules").addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest("[data-open-config]")) { switchView("config"); return; }
   const row = (event.target as HTMLElement).closest<HTMLElement>("[data-market-rule]");
-  if (!row || !(event.target as HTMLElement).closest(".market-edit")) return;
+  if (!row) return;
+  if ((event.target as HTMLElement).closest(".market-lots")) {
+    void toggleActiveLots(row, Number(row.dataset.marketRule));
+    return;
+  }
+  if (!(event.target as HTMLElement).closest(".market-edit")) return;
   editingIndex = Number(row.dataset.marketRule); setForm(rules[editingIndex]); renderRules(); switchView("config");
 });
 $("#clear-matches").addEventListener("click", () => { matches = []; renderMatches(); });
@@ -1593,14 +2252,27 @@ $("#analytics-load").addEventListener("click", () => void loadAnalytics());
 ["analytics-region", "analytics-signal", "analytics-sort"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderAnalytics));
 $("#scanner-load").addEventListener("click", () => void loadScanner());
 ["scanner-region", "scanner-horizon"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", renderScanner));
-["scanner-fee", "scanner-min-roi", "scanner-search"].forEach((id) => input(id).addEventListener("input", renderScanner));
+["scanner-min-roi", "scanner-search"].forEach((id) => input(id).addEventListener("input", renderScanner));
+input("scanner-fee").addEventListener("input", () => { renderScanner(); renderAnalytics(); });
 $("#scanner-list").addEventListener("click", (event) => {
   const card = (event.target as HTMLElement).closest<HTMLElement>("[data-opportunity-id]");
   if (!card) return;
+  if ((event.target as HTMLElement).closest(".deep-analysis-open")) {
+    const insight = scannerInsights[Number(card.dataset.opportunityIndex)];
+    const opportunity = insight && opportunityFor(insight, Math.max(0, numberValue("scanner-fee") ?? 0), Number($<HTMLSelectElement>("#scanner-horizon").value));
+    if (opportunity) void openDeepAnalysis(opportunity);
+    return;
+  }
   if ((event.target as HTMLElement).closest(".scenario-open")) {
     const insight = scannerInsights[Number(card.dataset.opportunityIndex)];
     const opportunity = insight && opportunityFor(insight, Math.max(0, numberValue("scanner-fee") ?? 0), Number($<HTMLSelectElement>("#scanner-horizon").value));
     if (opportunity) void openScenario(opportunity);
+    return;
+  }
+  if ((event.target as HTMLElement).closest(".ai-analysis-open")) {
+    const insight = scannerInsights[Number(card.dataset.opportunityIndex)];
+    const opportunity = insight && opportunityFor(insight, Math.max(0, numberValue("scanner-fee") ?? 0), Number($<HTMLSelectElement>("#scanner-horizon").value));
+    if (opportunity) openAiAnalysis(opportunity);
     return;
   }
   const button = (event.target as HTMLElement).closest(".scanner-rule");
@@ -1622,15 +2294,26 @@ $("#scanner-list").addEventListener("click", (event) => {
   renderRules();
   toast("Правило покупки подготовлено");
 });
+$("#ai-analyze").addEventListener("click", () => void runAiAnalysis());
 ["scenario-buy", "scenario-sell", "scenario-amount", "scenario-fee"].forEach((id) => input(id).addEventListener("input", renderScenarioCalculation));
+$("#stack-strategy-calculate").addEventListener("click", () => void loadStackStrategy());
+["stack-buy-max-amount", "stack-sell-min-amount", "stack-target-amount", "stack-max-buy-unit"].forEach((id) => input(id).addEventListener("change", () => void loadStackStrategy()));
+input("scenario-fee").addEventListener("change", () => void loadStackStrategy());
 $("#movement-load").addEventListener("click", () => void loadMovement());
 ["movement-hours", "movement-region"].forEach((id) => $<HTMLSelectElement>(`#${id}`).addEventListener("change", () => void loadMovement()));
 $("#movement-quality-options").addEventListener("change", () => void loadMovement());
 ["movement-min-upgrade", "movement-max-upgrade"].forEach((id) => input(id).addEventListener("change", () => void loadMovement()));
+$<HTMLSelectElement>("#movement-amount-preset").addEventListener("change", () => { applyMovementAmountPreset(); void loadMovement(); });
+["movement-min-amount", "movement-max-amount"].forEach((id) => input(id).addEventListener("change", () => {
+  $<HTMLSelectElement>("#movement-amount-preset").value = "custom";
+  void loadMovement();
+}));
 $("#movement-reset-variant").addEventListener("click", () => {
   document.querySelectorAll<HTMLInputElement>("#movement-quality-options input").forEach((checkbox) => checkbox.checked = false);
   input("movement-min-upgrade").value = "";
   input("movement-max-upgrade").value = "";
+  $<HTMLSelectElement>("#movement-amount-preset").value = "all";
+  applyMovementAmountPreset();
   void loadMovement();
 });
 input("movement-search").addEventListener("input", renderMovement);
@@ -1641,9 +2324,14 @@ $("#movement-list").addEventListener("click", (event) => {
   renderMovement();
 });
 $("#recommendation-list").addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest(".recommendation-rule");
   const card = (event.target as HTMLElement).closest<HTMLElement>("[data-recommendation-id]");
-  if (!button || !card) return;
+  if (!card) return;
+  if ((event.target as HTMLElement).closest(".recommendation-metrics")) {
+    switchAdvisorSection("metrics");
+    return;
+  }
+  const button = (event.target as HTMLElement).closest(".recommendation-rule");
+  if (!button) return;
   const itemId = card.dataset.recommendationId!;
   const region = card.dataset.recommendationRegion!;
   const item = catalog.find((candidate) => candidate.id === itemId);

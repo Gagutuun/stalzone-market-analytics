@@ -1,5 +1,6 @@
 .env
 .auction_seen.json
+.auction_rapid_seen.json
 .auction_gui_tmp*.json
 auction_watchlist.json
 __pycache__/
@@ -7,4 +8,5 @@ node_modules/
 dist/
 src-tauri/target/
 rustup-init.exe
+*.exe
 market_cache.sqlite3*
